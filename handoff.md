@@ -15,14 +15,13 @@ Reads the project handoff document and either:
 
 ## START mode
 
-1. Read `D:\.ai\staulks\.claude\HANDOFF.md` in full.
+1. Read `HANDOFF.md` in the project root in full.
 
 2. Print a concise "Ready to work" summary covering:
-   - Last REQ ID and last commit SHA
-   - Current test counts (regression / total)
-   - Next available REQ ID
-   - Any known limitations or follow-up items from Section 9
-   - One-liner reminder of the ICM pipeline step sequence
+   - Last commit SHA and message
+   - In-progress work and current status
+   - Any known blockers or follow-up items
+   - Next steps the user left off at
 
 3. Confirm: "Handoff loaded. What would you like to work on?"
 
@@ -37,34 +36,31 @@ Walk through these steps in order, pausing after each for the user's input:
 ### Step 1 — Gather session delta
 
 Ask the user (or infer from context if the conversation is available):
-- What REQ IDs were worked on this session?
+- What was worked on this session?
 - What was the last commit SHA and message?
 - Were any new paths, patterns, or gotchas discovered?
 - Were any known limitations resolved or added?
 
 ### Step 2 — Update HANDOFF.md
 
-Read `D:\.ai\staulks\.claude\HANDOFF.md`, then apply these specific updates:
+Read `HANDOFF.md`, then apply these specific updates:
 
 | Section | What to update |
 |---------|----------------|
-| Header line | `Last updated`, `Last REQ`, `Last commit` |
-| §7 "Next available REQ ID" | Increment past the highest REQ used |
-| §7 Register version | Update if register version changed |
-| §7 Matrix version | Update if matrix version changed |
-| §9 "Recent commits" | Prepend new commits (keep last ~8) |
-| §9 "Known limitations" | Add/remove items as appropriate |
+| Header line | `Last updated`, `Last commit` |
+| Recent commits | Prepend new commits (keep last ~8) |
+| Known limitations | Add/remove items as appropriate |
 | Any section | Add new paths, patterns, gotchas |
 
-Write the updated file back to `D:\.ai\staulks\.claude\HANDOFF.md`.
+Write the updated file back to `HANDOFF.md`.
 
 ### Step 3 — Compose the session summary
 
 Produce a compact Markdown summary suitable for pasting into the next session's
-compact message (the format used at the start of this session). Include:
+context. Include:
 
 1. **Primary Request and Intent** — what the user asked for
-2. **Key Technical Concepts** — algorithms, Qt patterns, design decisions
+2. **Key Technical Concepts** — algorithms, patterns, design decisions
 3. **Files and Code Sections** — exact paths and key changes with snippets
 4. **Errors and Fixes** — bugs hit and how they were resolved
 5. **Problem Solving** — non-obvious decisions
@@ -75,7 +71,7 @@ compact message (the format used at the start of this session). Include:
 ### Step 4 — Commit the handoff file
 
 ```
-git add D:\.ai\staulks\.claude\HANDOFF.md
+git add HANDOFF.md
 git commit -m "docs: update HANDOFF.md for session end <date>"
 ```
 
@@ -85,11 +81,9 @@ Ask the user whether to push: `git push origin master`.
 
 ## Notes
 
-- The handoff file lives at `D:\.ai\staulks\.claude\HANDOFF.md`.
-- It is **committed to the repo** (not gitignored) so it travels with the code.
+- `HANDOFF.md` is assumed to live at the project root.
+- It should be **committed to the repo** (not gitignored) so it travels with the code.
 - Never include actual credential values in the handoff document — reference
-  the `.env` file by path only.
+  config/env files by path only.
 - The session summary (Step 3) is separate from HANDOFF.md — it is printed to
   the chat for the user to copy, not written to any file.
-
-
