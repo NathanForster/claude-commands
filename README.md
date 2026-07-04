@@ -61,6 +61,17 @@ An end-of-session checklist for ICM-governed projects that runs the whole close-
 
 ---
 
+### `/docs-review`
+
+A deep review-and-update pass over every document in a project's `docs/` (or `documentation/`) folder.
+
+- **Per-document review** — reads each document in full, flagging incomplete sections, `TBD`/placeholder content, and anything that has drifted from the current code or requirements.
+- **Cross-reference checks** — verifies identifiers, cross-document links, terminology, and duplicated facts agree across the whole suite.
+- **Update & backfill** — after a findings-table confirmation, fixes stale content, backfills sections now knowable from the code/requirements/tests, and repairs cross-references (scoped `[TBD]`s where information genuinely doesn't exist yet).
+- **Composite PDF** — if the folder contains a combined PDF, locates its `.py` build script and re-runs it to regenerate the PDF.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
