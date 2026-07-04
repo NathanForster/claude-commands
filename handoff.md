@@ -1,3 +1,8 @@
+---
+description: Session continuity helper — load context on start, update HANDOFF.md on end
+argument-hint: start | end
+---
+
 # Handoff — Session Start / End Helper
 
 Reads the project handoff document and either:
@@ -6,10 +11,11 @@ Reads the project handoff document and either:
 
 ## Detecting mode
 
-- If the user typed `/handoff start` (or just `/handoff` at the start of a new
-  session): run **START mode**.
-- If the user typed `/handoff end` (or `/handoff update`): run **END mode**.
-- If ambiguous, ask: "Are you starting a new session or ending one?"
+Inspect `$ARGUMENTS`:
+
+- `start` (or empty at the start of a new session): run **START mode**.
+- `end` (or `update`): run **END mode**.
+- Anything else / ambiguous: ask "Are you starting a new session or ending one?"
 
 ---
 
@@ -17,13 +23,18 @@ Reads the project handoff document and either:
 
 1. Read `HANDOFF.md` in the project root in full.
 
-2. Print a concise "Ready to work" summary covering:
+2. **Verify freshness.** Run `git log -1 --format="%H %s"` and compare against the
+   `Last commit` recorded in `HANDOFF.md`. If they differ, warn the user that the
+   previous session likely ended without running `/handoff end`, so the handoff
+   may be stale — recent commits may not be reflected below.
+
+3. Print a concise "Ready to work" summary covering:
    - Last commit SHA and message
    - In-progress work and current status
    - Any known blockers or follow-up items
    - Next steps the user left off at
 
-3. Confirm: "Handoff loaded. What would you like to work on?"
+4. Confirm: "Handoff loaded. What would you like to work on?"
 
 Do NOT re-read the handoff on every subsequent turn — it is loaded once.
 
@@ -31,11 +42,12 @@ Do NOT re-read the handoff on every subsequent turn — it is loaded once.
 
 ## END mode
 
-Walk through these steps in order, pausing after each for the user's input:
-
 ### Step 1 — Gather session delta
 
-Ask the user (or infer from context if the conversation is available):
+When the session's conversation is in context, **infer** these and confirm the
+assembled delta once, rather than prompting for each item. Only fall back to
+asking item-by-item if the conversation is unavailable or ambiguous:
+
 - What was worked on this session?
 - What was the last commit SHA and message?
 - Were any new paths, patterns, or gotchas discovered?
@@ -64,18 +76,23 @@ context. Include:
 3. **Files and Code Sections** — exact paths and key changes with snippets
 4. **Errors and Fixes** — bugs hit and how they were resolved
 5. **Problem Solving** — non-obvious decisions
-6. **All User Messages** — verbatim list
+6. **User Requests** — paraphrased list of what the user asked for (quote
+   verbatim only where exact wording matters)
 7. **Pending Tasks** — anything explicitly left incomplete
 8. **Current Work** — last thing done before session end
 
 ### Step 4 — Commit the handoff file
+
+> **When invoked from `/session-close`:** skip this step. Session-close makes a
+> single commit that already includes `HANDOFF.md`. Only commit here when
+> `/handoff end` was run on its own.
 
 ```
 git add HANDOFF.md
 git commit -m "docs: update HANDOFF.md for session end <date>"
 ```
 
-Ask the user whether to push: `git push origin master`.
+Ask the user whether to push the current branch: `git push origin HEAD`.
 
 ---
 

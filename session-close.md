@@ -1,34 +1,40 @@
+---
+description: End-of-session checklist — validate requirements, add tests, build, document, commit
+---
+
 # Session Close
 
-Runs the standard end-of-session checklist for FRIS_NET (and any ICM-governed
-DoD project):
+Runs the standard end-of-session checklist for any ICM-governed project (and
+DoD projects that also maintain a DID documentation suite):
 
 1. **ICM validation** — audit every requirement against source code and pipeline
    artifacts, advance statuses, fill gaps where possible.
-2. **Additional tests** — identify untested pure functions and add xUnit coverage.
-3. **Build & test** — `dotnet build` + `dotnet test`; fix any failures before
-   continuing.
-4. **DID audit** — review the DoD Data Item Description documents in `DIDs/` and
-   fill in sections that can now be accurately completed given the current
-   state of the code and requirements.
-5. **Commit & push** — stage everything, commit with a descriptive message, push
-   to remote.
-6. **Handoff** — run `/handoff end` to update `HANDOFF.md` and print the session
-   summary.
+2. **Additional tests** — identify untested pure functions and add coverage.
+3. **Build & test** — build and test with the project's standard commands; fix
+   any failures before continuing.
+4. **DID audit** — if the project keeps a DoD Data Item Description suite in
+   `docs/`, fill in sections that can now be accurately completed. Skip this
+   step entirely for projects without a `docs/GUIDE.md`.
+5. **Handoff** — run `/handoff end` to update `HANDOFF.md` and produce the
+   session summary (without its own commit — Step 6 handles that).
+6. **Commit & push** — stage everything, commit once with a descriptive message,
+   push the current branch.
 
 ---
 
 ## Step 1 — ICM Validation
 
-Follow the full process defined in `/icm-validate`:
+Follow the full process defined in `/icm-validate`, including its **findings-table
+confirmation gate**: present the findings table and get user confirmation before
+writing to the register or matrix.
 
 - Read `requirements/workflows/03-baseline/requirements-register.md` in full.
 - For every `Baselined` or `Implemented` row:
-  - Check whether code exists in `src/` (Data/, Forms/, Modules/).
+  - Check whether code exists in `src/`.
   - Check whether `source-development/workflows/03-implementation/input_<REQ-ID>_implementation.md` exists.
   - Check whether `source-development/workflows/04-validation/input_<REQ-ID>_validation.md` exists.
 - Produce a findings table (REQ ID | Title | Current Status | Code | Impl artifact | Val artifact | New Status).
-- Update the register and `requirements/workflows/04-trace/traceability-matrix.md`:
+- On confirmation, update the register and `requirements/workflows/04-trace/traceability-matrix.md`:
   - Advance `Baselined` → `Implemented` where code is confirmed present.
   - Append `(backfill needed)` to Trace cells that are missing ICM artifacts.
   - Do NOT mark anything `Verified` without an explicit passing test or explicit user confirmation.
@@ -38,25 +44,25 @@ Follow the full process defined in `/icm-validate`:
 
 ## Step 2 — Additional Tests
 
-- Read every `.vb` file under `Modules/` that contains public pure functions
-  (functions whose output depends only on arguments, not DB or UI state).
-- Compare against existing test files in `FRIS.Tests/` to find gaps.
-- Add new `<Fact>` test methods (or new test classes) for any untested functions
-  that can be tested without a live DB or running form.
-- Naming: one test class per source module, file `FRIS.Tests/<ModuleName>Tests.vb`.
-- New tests must satisfy: no live SQL connection, no running form, no real
-  filesystem beyond `Path.GetTempFileName()` (cleaned up in `Finally`).
+- Read every source file that contains public pure functions (functions whose
+  output depends only on arguments, not DB or UI state).
+- Compare against the project's existing test suite to find gaps.
+- Add new test methods (or new test classes) for any untested functions that can
+  be tested without a live DB or running UI. Place them in the project's existing
+  test project/directory, following its existing naming convention (typically one
+  test class per source module).
+- New tests must satisfy: no live SQL connection, no running UI, no real
+  filesystem beyond a temp file that is cleaned up afterward.
 - If a function cannot be tested without infrastructure (DB, serial port, network),
-  add a comment `' [deferred — needs integration test harness]` and move on.
+  add a comment `// [deferred — needs integration test harness]` (or the language's
+  comment syntax) and move on.
 
 ---
 
 ## Step 3 — Build & Test
 
-```powershell
-dotnet build FRIS.sln
-dotnet test FRIS.sln
-```
+Use the project's standard build and test commands (e.g. `dotnet build` /
+`dotnet test`, `npm run build` / `npm test`, `make`, etc. — detect from the repo).
 
 - Fix every build error before proceeding.
 - Fix every test failure before proceeding.
@@ -66,30 +72,15 @@ dotnet test FRIS.sln
 
 ## Step 4 — DID Audit (DoD Data Item Descriptions)
 
+**Skip this step if the project has no `docs/GUIDE.md`.**
+
 **DID = Data Item Description** — the formal DoD documentation artifacts defined
-by MIL-STD-498 and subsequent DIDs. This project's DID suite lives in `DIDs/`.
+by MIL-STD-498 and subsequent DIDs. When present, this project's DID suite lives
+in `docs/`.
 
-Read `DIDs/GUIDE.md` first to understand the dependency order and which documents
-feed which others. The current DID suite includes:
-
-| File | Document |
-|------|----------|
-| `CI-DI-SESS-82007B.md` | CI Documentation Recommendation |
-| `CMP-DI-SESS-80858D.md` | Configuration Management Plan |
-| `SRS-DI-IPSC-81433A.md` | Software Requirements Specification |
-| `IRS-DI-IPSC-81434A.md` | Interface Requirements Specification |
-| `SDD-DI-IPSC-81435B.md` | Software Design Description |
-| `SDP-DI-IPSC-81427B.md` | Software Development Plan |
-| `STP-DI-IPSC-81438A.md` | Software Test Plan |
-| `STPr-Combined.md` | Software Test Procedures (combined) |
-| `STR-DI-IPSC-81440A.md` | Software Test Report |
-| `RTVM-DI-MGMT-82133A.md` | Requirements Traceability/Verification Matrix |
-| `SSS-DI-IPSC-81431A.md` | System/Subsystem Specification |
-| `SPS-DI-IPSC-81441A.md` | Software Product Specification |
-| `SVD-DI-IPSC-81442A.md` | Software Version Description |
-| `CTP-DI-SCRE-82140A.md` | Cybersecurity Test Plan |
-| `CTPr-DI-MGMT-82141A.md` | Cybersecurity Test Procedures |
-| `CTR-DI-MGMT-82142A.md` | Cybersecurity Test Report |
+Read `docs/GUIDE.md` first — it is the single source of truth for which documents
+exist, their dependency order, and which documents feed which others. Audit the
+documents it lists (do not rely on a hardcoded file list here).
 
 ### Audit process
 
@@ -104,8 +95,8 @@ For each DID:
      requirement text, status, and traceability.
    - `requirements/workflows/04-trace/traceability-matrix.md` — for
      verification mappings.
-   - `src/` (Data/, Forms/, Modules/) — for actual design and implementation
-     facts (module names, class names, method signatures, data flow).
+   - `src/` — for actual design and implementation facts (module names, class
+     names, method signatures, data flow).
    - `source-development/workflows/03-implementation/` and
      `source-development/workflows/04-validation/` — for design decisions and
      validation outcomes.
@@ -116,9 +107,10 @@ For each DID:
    numbers), leave it as `[TBD — requires <specific missing input>]` and note
    it in the session summary.
 
-4. **Priority order** — fill the highest-leverage documents first:
+4. **Priority order** — fill the highest-leverage documents first (adjust to the
+   suite GUIDE.md actually defines):
    - RTVM (feeds STR and is the spine of all traceability)
-   - STR (test results are now knowable from `dotnet test`)
+   - STR (test results are now knowable from the test run)
    - SDD (design is now largely knowable from the source)
    - SRS (requirements are baselined and stable)
    - SVD (version info is knowable from git log)
@@ -129,19 +121,27 @@ For each DID:
 
 ---
 
-## Step 5 — Commit & Push
+## Step 5 — Handoff
 
-Stage all modified files:
+Invoke `/handoff end` to update `HANDOFF.md` and produce the session summary.
+Do **not** let handoff run its own commit/push — Step 6 makes a single commit
+that includes `HANDOFF.md` along with everything else.
+
+---
+
+## Step 6 — Commit & Push
+
+Stage all modified files (including `HANDOFF.md` from Step 5):
 
 ```powershell
 git add -A
 ```
 
-Commit with a message that summarises what changed (req statuses, test count,
+Commit once with a message that summarises what changed (req statuses, test count,
 DID sections filled):
 
 ```
-feat/docs: session-close — <short summary>
+docs: session-close — <short summary>
 
 - ICM: <N> reqs advanced, <M> artifacts backfilled
 - Tests: <K> new tests added, <total> total passing
@@ -149,28 +149,21 @@ feat/docs: session-close — <short summary>
 - Build: 0 errors
 ```
 
-Then push:
+Then push the current branch:
 
 ```powershell
-git push origin master
+git push origin HEAD
 ```
-
----
-
-## Step 6 — Handoff
-
-Invoke `/handoff end` — follow all steps in that skill to update `HANDOFF.md`
-and print the session summary.
 
 ---
 
 ## Notes
 
-- Run steps in order. Do not push (Step 5) until build and tests pass (Step 3).
+- Run steps in order. Do not commit/push (Step 6) until build and tests pass (Step 3).
 - `Superseded` requirements: skip in all steps.
 - If any source file has no register entry, flag it for the user — do not
   silently create REQ IDs.
-- The DID audit is "best effort" — fill only what can be accurately stated.
-  A well-scoped `[TBD]` is better than a plausible fabrication.
+- The DID audit (documents live in `docs/`) is "best effort" — fill only what can
+  be accurately stated. A well-scoped `[TBD]` is better than a plausible fabrication.
 - The RTVM is the spine: all requirement UIDs must match those in the SRS/IRS.
   Cross-check identifiers before writing verification status into the RTVM or STR.

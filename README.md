@@ -44,7 +44,20 @@ Checks every requirement in the register against:
 - Implementation briefs in `source-development/workflows/03-implementation/`
 - Validation briefs in `source-development/workflows/04-validation/`
 
-Updates the `Status` column in both the requirements register and traceability matrix with one of: `Baselined`, `Implemented`, `Verified`, `Deferred`, or `Deleted`.
+Updates the `Status` column in both the requirements register and traceability matrix with one of: `Baselined`, `Implemented`, `Verified`, or `Superseded`.
+
+---
+
+### `/session-close`
+
+An end-of-session checklist for ICM-governed projects that runs the whole close-out in order:
+
+1. **ICM validation** — runs `/icm-validate` (with its confirmation gate) to advance requirement statuses.
+2. **Additional tests** — adds coverage for untested pure functions.
+3. **Build & test** — builds and tests with the project's standard commands, fixing failures before continuing.
+4. **DID audit** — for DoD projects with a Data Item Description suite in `docs/`, fills in sections now knowable from the code and requirements. Skipped automatically when there's no `docs/GUIDE.md`.
+5. **Handoff** — runs `/handoff end` to update `HANDOFF.md` and produce the session summary.
+6. **Commit & push** — a single commit covering everything (including `HANDOFF.md`), pushed to the current branch.
 
 ---
 

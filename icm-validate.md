@@ -1,3 +1,7 @@
+---
+description: Audit ICM requirements against code and pipeline artifacts, update statuses
+---
+
 # ICM: Validate Implementation
 
 Checks every requirement in the register against the actual source code AND the
@@ -70,12 +74,15 @@ the requirements register and the traceability matrix.
 - Check the current date from the system context (`currentDate`) for the `Updated:` stamp.
 - If a requirement is partially implemented, set Status to `Implemented` but append
   `(partial — <gap description>)` in the Trace column so the gap is visible.
-- Do not mark anything `Verified` unless there is an explicit test in
-  `testing-validation/` or `src/tests/` that covers it, or the user explicitly
-  confirms manual verification.
+- Do not mark anything `Verified` unless there is an explicit test in the
+  project's test suite (e.g. `testing-validation/`, `src/tests/`, or the project's
+  dedicated test project) that covers it, or the user explicitly confirms manual
+  verification.
 - `Superseded` rows: skip entirely.
 - If a new requirement has been added to `src/` that has no register entry, flag it
   for the user — do not silently create new REQ IDs.
-- Artifact naming convention: `input_req<NN>_implementation.md` and
-  `input_req<NN>_validation.md` (lowercase, no leading zeros beyond two digits).
-  Also accept `input_<req_id>_*` variants used in earlier sessions.
+- Canonical artifact naming: `input_<REQ-ID>_implementation.md` and
+  `input_<REQ-ID>_validation.md`, where `<REQ-ID>` is the register's requirement
+  ID (e.g. `input_REQ-42_implementation.md`). This is the form `/session-close`
+  also expects. Treat the older `input_req<NN>_*` spelling as legacy — accept it
+  when scanning, but write any new artifacts with the canonical form.
