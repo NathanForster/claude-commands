@@ -1,5 +1,6 @@
 ---
 description: Audit ICM requirements against code and pipeline artifacts, update statuses
+argument-hint: [REQ-ID]
 ---
 
 # ICM: Validate Implementation
@@ -7,6 +8,10 @@ description: Audit ICM requirements against code and pipeline artifacts, update 
 Checks every requirement in the register against the actual source code AND the
 source-development pipeline artifacts, then updates the `Status` column in both
 the requirements register and the traceability matrix.
+
+**Scope:** if `$ARGUMENTS` names a requirement ID (e.g. `REQ-42`), validate only
+that row — same checks, same findings table, same confirmation gate. Otherwise
+audit the full register.
 
 ## Files
 

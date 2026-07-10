@@ -12,9 +12,9 @@ DoD projects that also maintain a DID documentation suite):
 2. **Additional tests** — identify untested pure functions and add coverage.
 3. **Build & test** — build and test with the project's standard commands; fix
    any failures before continuing.
-4. **DID audit** — if the project keeps a DoD Data Item Description suite in
-   `docs/`, fill in sections that can now be accurately completed. Skip this
-   step entirely for projects without a `docs/GUIDE.md`.
+4. **Docs audit** — run `/docs-review` over the documentation folder (detailed
+   review, cross-reference checks, backfill, composite PDF rebuild). Skip this
+   step entirely for projects without a `docs/` or `documentation/` folder.
 5. **Handoff** — run `/handoff end` to update `HANDOFF.md` and produce the
    session summary (without its own commit — Step 6 handles that).
 6. **Commit & push** — stage everything, commit once with a descriptive message,
@@ -70,54 +70,32 @@ Use the project's standard build and test commands (e.g. `dotnet build` /
 
 ---
 
-## Step 4 — DID Audit (DoD Data Item Descriptions)
+## Step 4 — Docs Audit
 
-**Skip this step if the project has no `docs/GUIDE.md`.**
+**Skip this step if the project has no `docs/` (or `documentation/`) folder.**
 
-**DID = Data Item Description** — the formal DoD documentation artifacts defined
-by MIL-STD-498 and subsequent DIDs. When present, this project's DID suite lives
-in `docs/`.
+Run `/docs-review` — it performs the detailed per-document review,
+cross-reference checks, update and backfill (behind its own findings-table
+confirmation gate), and rebuilds the composite PDF if one exists.
 
-Read `docs/GUIDE.md` first — it is the single source of truth for which documents
-exist, their dependency order, and which documents feed which others. Audit the
-documents it lists (do not rely on a hardcoded file list here).
+When the suite is a DoD **Data Item Description (DID)** set — the MIL-STD-498
+documentation artifacts, indicated by a `docs/GUIDE.md` listing them — apply
+this DID-specific guidance on top of `/docs-review`:
 
-### Audit process
-
-For each DID:
-
-1. **Read the document.** Identify every section or placeholder that is still
-   empty, marked `TBD`, `[PLACEHOLDER]`, or is clearly incomplete relative to
-   what can now be known from the codebase and requirements register.
-
-2. **Fill in what is reasonable and possible now.** Use the following sources:
-   - `requirements/workflows/03-baseline/requirements-register.md` — for
-     requirement text, status, and traceability.
-   - `requirements/workflows/04-trace/traceability-matrix.md` — for
-     verification mappings.
-   - `src/` — for actual design and implementation facts (module names, class
-     names, method signatures, data flow).
-   - `source-development/workflows/03-implementation/` and
-     `source-development/workflows/04-validation/` — for design decisions and
-     validation outcomes.
-   - Build and test results from Step 3 — for STR and RTVM verification status.
-
-3. **Do not fabricate.** If a section requires information that does not yet
-   exist (e.g., formal acceptance test results, CDRL submission dates, contract
-   numbers), leave it as `[TBD — requires <specific missing input>]` and note
-   it in the session summary.
-
-4. **Priority order** — fill the highest-leverage documents first (adjust to the
-   suite GUIDE.md actually defines):
-   - RTVM (feeds STR and is the spine of all traceability)
-   - STR (test results are now knowable from the test run)
-   - SDD (design is now largely knowable from the source)
-   - SRS (requirements are baselined and stable)
-   - SVD (version info is knowable from git log)
-   - Remaining documents as time permits.
-
-5. **Update the `Updated:` or `Date:` field** in each modified DID to the
-   current date (use `currentDate` from system context).
+- Read `docs/GUIDE.md` first — it is the single source of truth for which
+  documents exist, their dependency order, and which documents feed which others.
+- Feed the review two extra sources beyond the codebase: the requirements
+  register and traceability matrix (from Step 1), and the build/test results
+  from Step 3 (for STR and RTVM verification status).
+- Backfill in priority order — highest leverage first:
+  - RTVM (feeds STR and is the spine of all traceability)
+  - STR (test results are now knowable from the test run)
+  - SDD (design is now largely knowable from the source)
+  - SRS (requirements are baselined and stable)
+  - SVD (version info is knowable from git log)
+  - Remaining documents as time permits.
+- The RTVM is the spine: all requirement UIDs must match those in the SRS/IRS.
+  Cross-check identifiers before writing verification status into the RTVM or STR.
 
 ---
 
@@ -131,9 +109,17 @@ that includes `HANDOFF.md` along with everything else.
 
 ## Step 6 — Commit & Push
 
-Stage all modified files (including `HANDOFF.md` from Step 5):
+Review the working tree first and flag anything unexpected — files unrelated to
+this session's work should be surfaced to the user before staging, not swept in
+silently:
 
-```powershell
+```sh
+git status --short
+```
+
+Then stage all modified files (including `HANDOFF.md` from Step 5):
+
+```sh
 git add -A
 ```
 
@@ -151,7 +137,7 @@ docs: session-close — <short summary>
 
 Then push the current branch:
 
-```powershell
+```sh
 git push origin HEAD
 ```
 
@@ -163,7 +149,5 @@ git push origin HEAD
 - `Superseded` requirements: skip in all steps.
 - If any source file has no register entry, flag it for the user — do not
   silently create REQ IDs.
-- The DID audit (documents live in `docs/`) is "best effort" — fill only what can
-  be accurately stated. A well-scoped `[TBD]` is better than a plausible fabrication.
-- The RTVM is the spine: all requirement UIDs must match those in the SRS/IRS.
-  Cross-check identifiers before writing verification status into the RTVM or STR.
+- The docs audit is "best effort" — fill only what can be accurately stated.
+  A well-scoped `[TBD]` is better than a plausible fabrication.

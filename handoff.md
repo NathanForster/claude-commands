@@ -23,6 +23,10 @@ Inspect `$ARGUMENTS`:
 
 1. Read `HANDOFF.md` in the project root in full.
 
+   If the file does not exist (first session on this project), offer to create
+   it from the template in the **HANDOFF.md template** section below, then skip
+   to step 4.
+
 2. **Verify freshness.** Run `git log -1 --format="%H %s"` and compare against the
    `Last commit` recorded in `HANDOFF.md`. If they differ, warn the user that the
    previous session likely ended without running `/handoff end`, so the handoff
@@ -55,7 +59,8 @@ asking item-by-item if the conversation is unavailable or ambiguous:
 
 ### Step 2 — Update HANDOFF.md
 
-Read `HANDOFF.md`, then apply these specific updates:
+Read `HANDOFF.md` — if it does not exist, create it from the template in the
+**HANDOFF.md template** section below first — then apply these specific updates:
 
 | Section | What to update |
 |---------|----------------|
@@ -92,7 +97,40 @@ git add HANDOFF.md
 git commit -m "docs: update HANDOFF.md for session end <date>"
 ```
 
+Use `currentDate` from system context for `<date>`.
+
 Ask the user whether to push the current branch: `git push origin HEAD`.
+
+---
+
+## HANDOFF.md template
+
+When creating `HANDOFF.md` for the first time (either mode), seed it with:
+
+````markdown
+# HANDOFF
+
+Last updated: <date> | Last commit: <SHA> — <message>
+
+## Current state
+
+<one paragraph on where the project stands and what is in progress>
+
+## Recent commits
+
+- <SHA> — <message>
+
+## Known limitations
+
+- <item, or "None known">
+
+## Next steps
+
+- <item>
+````
+
+Fill the placeholders from `git log` and the current session before writing —
+do not leave literal `<...>` markers in the committed file.
 
 ---
 

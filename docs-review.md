@@ -1,5 +1,6 @@
 ---
 description: Deep review, cross-reference, and backfill of every document in docs/ (or documentation/), then rebuild the composite PDF
+argument-hint: [folder]
 ---
 
 # Docs Review & Update
@@ -17,7 +18,9 @@ do not skim.
 
 ## Step 0 — Locate the documentation folder
 
-Find the docs folder, in this precedence order:
+If `$ARGUMENTS` names a folder, use it directly and skip detection (if it does
+not exist, stop and report). Otherwise find the docs folder, in this precedence
+order:
 
 1. `docs/`
 2. `documentation/`
