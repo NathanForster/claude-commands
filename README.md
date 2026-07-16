@@ -12,6 +12,7 @@ These commands are designed to be dropped into any project and used across sessi
 | [`/icm-validate`](icm-validate.md) | Audit ICM requirement statuses against code and pipeline artifacts |
 | [`/session-close`](session-close.md) | Full end-of-session checklist — validate, test, document, commit |
 | [`/docs-review`](docs-review.md) | Deep review, cross-reference, and backfill of the docs folder, plus composite PDF rebuild |
+| [`/run`](run.md) | Launch the project's app in a named mode, driven by a `RUN.md` mode registry |
 
 ## Installation
 
@@ -84,6 +85,16 @@ A deep review-and-update pass over every document in a project's `docs/` (or `do
 - **Composite PDF** — if the folder contains a combined PDF, locates its `.py` build script and re-runs it to regenerate the PDF.
 
 Pass a folder — `/docs-review documentation` — to target a specific directory and skip auto-detection.
+
+---
+
+### `/run`
+
+Launches the project's app in a requested run mode — `/run <mode>`, or bare `/run` for the documented default.
+
+The command carries no project knowledge of its own: a `RUN.md` in the project root is the source of truth, defining the available modes, each mode's launcher and arguments, the launch sequence, and any gates. If the project has no `RUN.md`, the command offers to bootstrap one from what's actually in the repo (launch scripts, README, CI config) — verifying each mode before writing it down.
+
+Pairs with `RUN.md` the same way `/handoff` pairs with `HANDOFF.md`.
 
 ---
 
