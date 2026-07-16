@@ -69,7 +69,7 @@ An end-of-session checklist for ICM-governed projects that runs the whole close-
 1. **ICM validation** — runs `/icm-validate` (with its confirmation gate) to advance requirement statuses.
 2. **Additional tests** — adds coverage for untested pure functions.
 3. **Build & test** — builds and tests with the project's standard commands, fixing failures before continuing.
-4. **Docs audit** — runs `/docs-review` over the documentation folder, with DID-specific priority ordering for DoD projects. Skipped when there's no docs folder.
+4. **Docs audit** — runs `/docs-review` over the documentation folder, assuming full backfill of every section now knowable, with DID-specific priority ordering for DoD projects. Skipped when there's no docs folder.
 5. **Handoff** — runs `/handoff end` to update `HANDOFF.md` and produce the session summary.
 6. **Commit & push** — a single commit covering everything (including `HANDOFF.md`), pushed to the current branch.
 

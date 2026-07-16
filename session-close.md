@@ -78,6 +78,13 @@ Run `/docs-review` — it performs the detailed per-document review,
 cross-reference checks, update and backfill (behind its own findings-table
 confirmation gate), and rebuilds the composite PDF if one exists.
 
+**Assume full backfill is desired.** Fill every section that can now be
+accurately stated from the available sources — not just a minimal or
+highest-priority subset. The priority order below governs the *sequence* of
+work, not its scope. The no-fabrication rule still applies: where information
+genuinely does not exist yet, leave a scoped `[TBD — requires <input>]` rather
+than inventing content.
+
 When the suite is a DoD **Data Item Description (DID)** set — the MIL-STD-498
 documentation artifacts, indicated by a `docs/GUIDE.md` listing them — apply
 this DID-specific guidance on top of `/docs-review`:
