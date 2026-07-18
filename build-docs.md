@@ -10,8 +10,10 @@ table of contents + per-part section covers), using the **shared docset engine**
 so every project shares one copy of the (hard-won) table/heading pagination
 logic. Can also render a **single** Markdown file to a standalone PDF.
 
-The engine lives in this commands repo at **`lib/docset_builder.py`** (typically
-`C:\.ai\.claude\commands\lib\docset_builder.py`, or `~/.claude/commands/lib/`).
+The engine is loaded from **`~/.claude/commands/lib/docset_builder.py`** — the
+user-level copy that the sync script keeps current. Its master lives in the
+claude-commands repo (`lib/docset_builder.py`); fall back to that repo checkout
+(e.g. `C:\.ai\.claude\commands\lib\`) only if the user-level copy is missing.
 Its public API: `build_docset(...)`, `render_markdown_file(...)`, `load_config(...)`.
 
 **Requires** (in the project's Python): `pymupdf`, `markdown-it-py`, `pypdf`,

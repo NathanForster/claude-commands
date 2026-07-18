@@ -114,8 +114,10 @@ docset engine (not a per-project copy).
 BACKGROUND
 - The shared engine lives in my Claude commands repo:
   https://github.com/NathanForster/claude-commands  ->  lib/docset_builder.py
-- On this machine it should be at:  C:\.ai\.claude\commands\lib\docset_builder.py
-  If that file is missing, tell me and stop (I may need to `git pull` that repo).
+- On this machine it should be at:  ~/.claude/commands/lib/docset_builder.py
+  (the user-level copy, synced from that repo). If it is missing, check the repo
+  checkout (e.g. C:\.ai\.claude\commands\lib); if both are missing, tell me and
+  stop (I may need to `git pull` that repo and re-run its sync).
 - It renders Markdown -> PDF with automatic table column-fitting, cross-page header
   repetition, keep-heading-with-its-content, and silent-truncation verification.
 - Python deps (must be importable by the python you run): pymupdf, markdown-it-py,
@@ -124,8 +126,8 @@ BACKGROUND
 
 DO THIS
 1. Confirm the engine exists at one of: the CLAUDE_COMMANDS_LIB env var,
-   C:\.ai\.claude\commands\lib, or ~/.claude/commands/lib. Read its module
-   docstring for the current API/CLI.
+   ~/.claude/commands/lib, or the repo checkout (e.g. C:\.ai\.claude\commands\lib).
+   Read its module docstring for the current API/CLI.
 2. Inventory this project's docs/ folder. Propose a DOCSET.json structure --
    grouped into logical "parts", each doc with num/acr/file/title and a
    landscape flag (true only for wide tables, >~6 columns). SHOW me the proposed
@@ -144,10 +146,10 @@ DO THIS
      }
    (A `file` ending in .pdf is concatenated as a pre-rendered leaf; `../` may reach
    outside docs_dir; any key starting with `_` is ignored -- use `_notes` for
-   rationale. Template: C:\.ai\.claude\commands\lib\DOCSET.example.json)
+   rationale. Template: ~/.claude/commands/lib/DOCSET.example.json)
 4. Add a thin build script at orchestrator/build_docset_pdf.py that locates the
-   shared engine (env CLAUDE_COMMANDS_LIB -> C:\.ai\.claude\commands\lib ->
-   ~/.claude/commands/lib), then calls
+   shared engine (env CLAUDE_COMMANDS_LIB -> ~/.claude/commands/lib -> the
+   repo checkout, e.g. C:\.ai\.claude\commands\lib), then calls
    db.load_config('DOCSET.json') + db.build_docset(...). Keeping a .py entry point
    means /docs-review and /build-docs find and run it. (Model it on FRIS_NET's
    orchestrator/build_docset_pdf.py.)
@@ -162,7 +164,8 @@ Notes:
   `/build-docs` (or `/docs-review`) — it finds and runs the existing script instead
   of duplicating setup.
 - For a **one-off single file**:
-  `python C:\.ai\.claude\commands\lib\docset_builder.py --single <in.md> <out.pdf> [--landscape]`
+  `python $HOME/.claude/commands/lib/docset_builder.py --single <in.md> <out.pdf> [--landscape]`
+  (`$HOME` expands in both PowerShell and bash.)
 
 ---
 
