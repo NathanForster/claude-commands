@@ -1,0 +1,1118 @@
+"""Shared Markdown -> PDF engine: assembles a set of Markdown documents into one
+consolidated, bookmarked PDF (cover + linked TOC + per-part covers), and also
+renders a single Markdown file to a standalone PDF. Project-agnostic — every
+project-specific detail (which documents, titles, cover text, paths) is supplied
+by the caller, either as a JSON config or by importing this module.
+
+This lives in the shared Claude commands repo so multiple projects share ONE copy
+of the (hard-won) table/heading pagination logic. See `/build-docs`.
+
+Requires: pymupdf, markdown-it-py, pypdf, beautifulsoup4
+    pip install pymupdf markdown-it-py pypdf beautifulsoup4
+
+Public API
+----------
+    build_docset(structure, docs_dir, out_path, *, title, subtitle=None,
+                 cover_lines=(), base_css=None) -> int   # returns page count
+    render_markdown_file(src_md, out_pdf, *, landscape=False,
+                         base_css=None) -> int            # returns page count
+    load_config(path) -> dict                             # parse a DOCSET json
+
+`structure` is a list of parts: [(part_title, [leaf, ...]), ...] where each leaf
+is (num, acronym, filename, full_title, landscape_bool). A filename ending in
+`.pdf` is treated as a pre-rendered leaf (a generated section cover is prepended
+and the PDF concatenated as-is); filenames are resolved relative to `docs_dir`
+(".." is fine for a doc living outside it).
+
+CLI
+---
+    python docset_builder.py <config.json>              # build a docset
+    python docset_builder.py --single <in.md> <out.pdf> [--landscape]
+
+Table engine (rewritten 2026-07-09; all rules below verified empirically against
+the installed PyMuPDF Story engine before being relied on):
+  * Column widths: Story ignores every percent width form (col/th/td, attribute
+    or style) and lays such tables out with EQUAL columns. It honors absolute
+    lengths in a STYLE property (width:Npt) on <col>, treating them as
+    PROPORTIONAL WEIGHTS scaled to fill the table width -- an over/under-
+    subscribed sum cannot overflow the page. Widths here are computed per table
+    from content statistics (see compute_column_weights).
+  * Long unbreakable tokens (paths, REQ lists) widen a cell's layout floor and
+    can overpaint the neighboring column; Story honors U+200B (zero-width
+    space) as a break opportunity, so soft breaks are injected into any long
+    whitespace-free run inside table cells (inject_soft_breaks).
+  * A row taller than one page is SILENTLY TRUNCATED under col-width layout
+    (Story reports done with the remainder of the table unrendered -- worse
+    than a build failure). Every cell is therefore budget-split into
+    continuation rows sized to its own column width so no row can approach a
+    page in height (split_overlong_cells), and every rendered part is verified
+    against per-row canary needles afterwards (verify_no_lost_rows).
+  * Repeating headers: Story does NOT repeat <thead> across page breaks, and
+    page-break-before is honored on a wrapper <div> but NOT on a <table>.
+    Story is also not allowed to paginate a continuation table itself (a
+    chunk starting mid-page that must break entered an infinite placement
+    loop): rows of any page-spanning table are greedy-packed by their
+    MEASURED heights into chunks guaranteed to fit one page, each with a
+    cloned <colgroup>+<thead>, pinned to a fresh page by a page-break div
+    (repeat_headers_across_pages). Row page/height data comes from
+    Story.element_positions during a measurement render; note the measurement
+    loop MUST draw each placed page into a real DocumentWriter -- place()
+    alone does not advance the story (this, not table layout per se, is what
+    previously looked like a "no-progress oscillation").
+"""
+import copy
+import sys
+import tempfile
+from pathlib import Path
+
+import fitz
+from bs4 import BeautifulSoup, NavigableString
+from markdown_it import MarkdownIt
+from pypdf import PdfWriter, PdfReader
+
+# The document structure and paths are supplied by the caller (build_docset /
+# load_config); this module holds no project-specific data.
+
+md = MarkdownIt("commonmark").enable("table")
+
+BASE_CSS = """
+@page { size: {SIZE}; margin: 0; }
+body { font-family: Helvetica, Arial, sans-serif; font-size: 10.5px; line-height: 1.35; color: #1a1a1a; }
+h1 { font-size: 20px; margin: 0 0 10px 0; border-bottom: 2px solid #333; padding-bottom: 6px; }
+h2 { font-size: 15px; margin: 18px 0 6px 0; color: #1a3d6d; }
+h3 { font-size: 12.5px; margin: 14px 0 5px 0; color: #333; }
+h4 { font-size: 11px; margin: 10px 0 4px 0; }
+p { margin: 4px 0; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0; table-layout: fixed; }
+th, td { border: 0.75px solid #999; padding: 2px 4px; font-size: 7.5px; vertical-align: top; word-wrap: break-word; overflow-wrap: break-word; word-break: break-word; }
+th { font-weight: bold; border-bottom: 1.5px solid #333; }
+code { font-family: Consolas, monospace; font-size: 9px; }
+pre { background-color: #f5f5f5; padding: 6px; font-size: 8.5px; overflow-wrap: break-word; }
+ul, ol { margin: 4px 0; padding-left: 20px; }
+li { margin: 2px 0; }
+hr { border: none; border-top: 1px solid #ccc; margin: 10px 0; }
+.cover-part { font-size: 13px; color: #555; margin-bottom: 2px; }
+.cover-acronym { font-size: 26px; font-weight: bold; margin: 4px 0; }
+.cover-full { font-size: 16px; color: #333; margin-bottom: 4px; }
+"""
+
+# ---------------------------------------------------------------------------
+# Layout metrics (empirically measured against the rendered output; the table
+# borders of a portrait page land at x 46.5..565.5 -> 519pt of table width
+# inside the 36pt page margins plus Story's ~10.5pt body margin per side).
+PAGE_MARGIN = 36
+BODY_MARGIN = 10.5           # Story's built-in <body> margin per side
+TABLE_FONT_SIZE = 7.5
+LINE_H = 9.2                 # observed baseline-to-baseline at 7.5px/1.35
+# A col's style width is its CONTENT width; the engine adds padding (4+4) and
+# collapsed borders on top (measured ~8.9pt/col), and while an UNDER-subscribed
+# width set is scaled up to fill the table, an OVER-subscribed one is NOT
+# scaled down -- it overflows the page. Specified widths must therefore sum to
+# table_width - ncols*COL_OVERHEAD - TABLE_SLACK.
+COL_OVERHEAD = 8.9
+TABLE_SLACK = 2.0
+MAX_SOFT_RUN = 12            # longest whitespace-free run allowed in a cell
+MAX_CHUNK_ITERS = 12
+
+ZWSP = "​"
+# Preferred soft-break points inside long tokens (break AFTER these chars).
+BREAK_AFTER = set("/\\-_.,;:=)]}|&+#?")
+
+try:
+    CHAR_W = fitz.get_text_length(
+        "abcdefghijklmnopqrstuvwxyz0123456789_-./ABCDEFGHIJ",
+        fontname="helv", fontsize=TABLE_FONT_SIZE) / 50.0
+except Exception:
+    CHAR_W = 3.4
+
+
+def table_width_pt(landscape):
+    page_w = 792 if landscape else 612
+    return page_w - 2 * PAGE_MARGIN - 2 * BODY_MARGIN
+
+
+def page_content_height(landscape):
+    page_h = 612 if landscape else 792
+    return page_h - 2 * PAGE_MARGIN - 2 * BODY_MARGIN
+
+
+def text_width(s, bold=False):
+    font = "hebo" if bold else "helv"
+    try:
+        return fitz.get_text_length(s, fontname=font, fontsize=TABLE_FONT_SIZE)
+    except Exception:
+        return len(s) * CHAR_W
+
+
+def _node_font(tn):
+    """Measurement font for a text node: table cells mix 7.5px Helvetica with
+    9px monospace <code> spans — nearly half the width difference, which is
+    enough to blow row-height estimates if ignored."""
+    for p in tn.parents:
+        if p.name in ("code", "pre"):
+            return ("cour", 9.0)
+        if p.name == "th":
+            return ("hebo", TABLE_FONT_SIZE)
+        if p.name == "td":
+            break
+    return ("helv", TABLE_FONT_SIZE)
+
+
+def cell_px(cell):
+    """Total rendered text width of a cell's content, font-aware, in points."""
+    total = 0.0
+    for tn in cell.find_all(string=True):
+        font, size = _node_font(tn)
+        try:
+            total += fitz.get_text_length(str(tn).replace(ZWSP, ""), fontname=font, fontsize=size)
+        except Exception:
+            total += len(str(tn)) * CHAR_W
+    return total
+
+
+def frag_px(cell):
+    """Widest single unbreakable fragment in a cell (its layout floor)."""
+    worst = 0.0
+    for tn in cell.find_all(string=True):
+        font, size = _node_font(tn)
+        for frag in str(tn).replace(ZWSP, " ").split():
+            try:
+                w = fitz.get_text_length(frag, fontname=font, fontsize=size)
+            except Exception:
+                w = len(frag) * CHAR_W
+            worst = max(worst, w)
+    return worst
+
+
+def strip_frontmatter(text):
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            return text[end + 4:]
+    return text
+
+
+def md_to_html(text):
+    return md.render(strip_frontmatter(text))
+
+
+# ---------------------------------------------------------------------------
+# 1) Soft-break injection: bound the longest unbreakable run in every cell so
+#    no token can force a column past its assigned width (Story would let it
+#    overpaint the neighboring column, not wrap it).
+
+def soft_break_text(s, run=0, max_run=MAX_SOFT_RUN):
+    """Returns (text with U+200B soft breaks, run length at end). `run` is the
+    length of the unbreakable run already in progress when this text starts —
+    long runs frequently SPAN inline elements (<code>a</code>/<code>b</code>
+    concatenates with no break opportunity between the nodes), so the counter
+    must be carried across every text node of a cell, not reset per node."""
+    out = []
+    for ch in s:
+        out.append(ch)
+        if ch.isspace() or ch == ZWSP:
+            run = 0
+            continue
+        run += 1
+        if run >= max_run or (run >= max_run // 2 and ch in BREAK_AFTER):
+            out.append(ZWSP)
+            run = 0
+    return "".join(out), run
+
+
+def inject_soft_breaks(cell):
+    run = 0
+    for tn in list(cell.find_all(string=True)):
+        s = str(tn)
+        broken, run = soft_break_text(s, run)
+        if broken != s:
+            tn.replace_with(NavigableString(broken))
+
+
+# ---------------------------------------------------------------------------
+# 2) Content-measured column widths, emitted as <col style="width:Npt">
+#    (proportional weights -- see module docstring).
+
+def percentile(values, p):
+    if not values:
+        return 0
+    vs = sorted(values)
+    return vs[min(len(vs) - 1, int(round(p * (len(vs) - 1))))]
+
+
+def compute_column_weights(table, landscape):
+    """Optimum widths: each column gets its layout floor (widest unbreakable
+    fragment) plus a share of the remaining width proportional to its
+    90th-percentile rendered cell width. Proportional sharing (exponent 1.0)
+    was chosen by simulating total table height on the register/LIVE/RTVM
+    corpora against 0.6/0.8/1.0/1.2 — it equalizes wrapped line counts across
+    the columns of the tall rows, which is what minimizes page count."""
+    thead = table.find("thead")
+    tbody = table.find("tbody")
+    header_cells = thead.find_all("th") if thead else []
+    ncols = len(header_cells)
+    if ncols == 0:
+        return None
+    body_rows = tbody.find_all("tr", recursive=False) if tbody else []
+
+    floors, scores = [], []
+    for ci in range(ncols):
+        cells = []
+        for tr in body_rows:
+            tds = tr.find_all("td", recursive=False)
+            if ci < len(tds):
+                cells.append(tds[ci])
+        frag_w = max([frag_px(c) for c in cells] or [0.0])
+        frag_w = max(frag_w, frag_px(header_cells[ci]))
+        floors.append(frag_w + 2)
+        p90 = percentile([cell_px(c) for c in cells], 0.90)
+        scores.append(max(p90, 8.0))
+
+    total_w = table_width_pt(landscape) - ncols * COL_OVERHEAD - TABLE_SLACK
+    spare = total_w - sum(floors)
+    if spare < 0:
+        # Weights are proportional so the engine will scale everything down
+        # uniformly; fragments may slightly overpaint. Flag it.
+        print(f"WARNING: column floors exceed table width "
+              f"({sum(floors):.0f}pt > {total_w:.0f}pt) for headers "
+              f"{tuple(th.get_text(strip=True) for th in header_cells)}",
+              file=sys.stderr)
+        return floors
+    ssum = sum(scores) or 1.0
+    return [f + spare * s / ssum for f, s in zip(floors, scores)]
+
+
+def set_colgroup(table, soup, widths):
+    old = table.find("colgroup")
+    if old:
+        old.decompose()
+    colgroup = soup.new_tag("colgroup")
+    for w in widths:
+        col = soup.new_tag("col")
+        col["style"] = f"width:{w:.1f}pt"
+        colgroup.append(col)
+    table.insert(0, colgroup)
+
+
+# ---------------------------------------------------------------------------
+# 3) Cell budget-splitting: no row may approach one page in height, because a
+#    row taller than a page is silently truncated (with the rest of its table)
+#    under col-width layout. Height is estimated per cell from its measured
+#    text width (font-aware) against its column's content width; PACKING
+#    accounts for ragged line ends from soft-break wrapping.
+
+PACKING = 0.82
+ROW_PAGE_FRACTION = 0.5     # split any cell estimated taller than this
+
+
+def cell_char_budget(cell, col_width, landscape):
+    """Character budget for one cell, or None if it needs no split."""
+    text_len = len(cell.get_text())
+    if text_len < 300:
+        return None
+    content_w = max(col_width, 12.0)  # style width IS the content width
+    est_lines = cell_px(cell) / (content_w * PACKING)
+    allowed = ROW_PAGE_FRACTION * page_content_height(landscape) / LINE_H
+    if est_lines <= allowed:
+        return None
+    return max(300, int(text_len * allowed / est_lines))
+
+
+def _split_cell_into_chunks(cell, max_chars):
+    """Splits a <td>'s contents into chunks of <= max_chars text length,
+    breaking at child-node boundaries (and at '. ' inside any single text
+    node that itself exceeds the budget). Returns a list of node-lists."""
+    nodes = list(cell.contents)
+    chunks, cur, cur_len = [], [], 0
+    for node in nodes:
+        text = node.get_text() if hasattr(node, "get_text") else str(node)
+        if isinstance(node, NavigableString) and len(text) > max_chars:
+            # Oversized bare text node: split on sentence boundaries.
+            parts, buf = [], ""
+            for piece in str(node).split(". "):
+                piece = piece + ". "
+                if buf and len(buf) + len(piece) > max_chars:
+                    parts.append(buf)
+                    buf = piece
+                else:
+                    buf += piece
+            if buf:
+                parts.append(buf if str(node).rstrip().endswith(".") else buf.rstrip(". "))
+            for part in parts:
+                if cur_len + len(part) > max_chars and cur:
+                    chunks.append(cur)
+                    cur, cur_len = [], 0
+                cur.append(NavigableString(part))
+                cur_len += len(part)
+            continue
+        if cur_len + len(text) > max_chars and cur:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append(node)
+        cur_len += len(text)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def split_overlong_cells(table, soup, widths, landscape):
+    """For each body row, if any cell is estimated taller than half a page,
+    keep the first chunk in place and move the rest into inserted continuation
+    rows (first column carries an italic 'ID (cont'd)' marker, other cells
+    empty)."""
+    body = table.find("tbody") or table
+    for tr in list(body.find_all("tr", recursive=False)):
+        cells = tr.find_all("td", recursive=False)
+        if not cells:
+            continue
+        for ci, cell in enumerate(cells):
+            col_w = widths[ci] if ci < len(widths) else widths[-1]
+            budget = cell_char_budget(cell, col_w, landscape)
+            if budget is None:
+                continue
+            chunks = _split_cell_into_chunks(cell, budget)
+            if len(chunks) <= 1:
+                continue
+            row_id = cells[0].get_text(strip=True)[:40]
+            cell.clear()
+            for node in chunks[0]:
+                cell.append(node)
+            anchor = tr
+            for chunk in chunks[1:]:
+                new_tr = soup.new_tag("tr")
+                for i in range(len(cells)):
+                    new_td = soup.new_tag("td")
+                    if i == 0:
+                        em = soup.new_tag("em")
+                        em.string = f"{row_id} (cont'd)"
+                        new_td.append(em)
+                    elif i == ci:
+                        for node in chunk:
+                            new_td.append(node)
+                    new_tr.append(new_td)
+                anchor.insert_after(new_tr)
+                anchor = new_tr
+
+
+# ---------------------------------------------------------------------------
+# 4) Header repetition: Story neither repeats <thead> across page breaks nor
+#    reliably paginates a mid-page continuation table (a chunk starting
+#    mid-page that must itself break entered an infinite placement loop --
+#    observed both with plain sibling chunks and with page-break wrappers).
+#    So Story is never allowed to break a chunk: rows are greedy-packed by
+#    their MEASURED heights into chunks guaranteed to fit one page, each
+#    pinned to a fresh page by a page-break div (honored on a div; ignored on
+#    a table). One measurement pass + one verification pass.
+
+# No single document should come anywhere near this many pages (the whole
+# session-21 docset was ~410 for all 19 parts combined). Fail loudly if a
+# layout bug ever loops.
+MAX_PAGES_PER_DOC = 500
+
+CHUNK_SLACK = 30.0     # margins/borders headroom per pinned chunk, pt
+HEADER_H_FALLBACK = 18.0
+
+
+def measure_rows(html, css, mediabox, tmpdir, doc_name):
+    """Renders to a throwaway PDF recording each element id's first page and
+    its rect height. The draw() into a real DocumentWriter is REQUIRED:
+    place() alone never advances the story."""
+    story = fitz.Story(html=html, user_css=css)
+    out = tmpdir / "_measure.pdf"
+    writer = fitz.DocumentWriter(str(out))
+    where = mediabox + (PAGE_MARGIN, PAGE_MARGIN, -PAGE_MARGIN, -PAGE_MARGIN)
+    page_of, height_of = {}, {}
+
+    def cb(pos):
+        if pos.id and (pos.open_close & 1) and pos.id not in page_of:
+            page_of[pos.id] = pos.page_num
+            r = getattr(pos, "rect", None)
+            if r is not None:
+                height_of[pos.id] = r[3] - r[1]
+
+    more, page = True, 0
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.element_positions(cb, {"page_num": page})
+        story.draw(dev)
+        writer.end_page()
+        page += 1
+        if page > MAX_PAGES_PER_DOC:
+            writer.close()
+            raise RuntimeError(f"{doc_name}: measurement pass exceeded "
+                               f"{MAX_PAGES_PER_DOC} pages")
+    writer.close()
+    return page_of, height_of
+
+
+def _header_page(table, page_of):
+    htr = table.find("thead").find("tr")
+    return page_of.get(htr.get("id")) if htr is not None else None
+
+
+def _spanning_tables(soup, page_of):
+    """Tables needing repair: rows spread over multiple pages, OR an orphaned
+    header (thead stranded at a page bottom with every row on the next page —
+    the rows' page shows no header even though the tbody doesn't span)."""
+    out = []
+    for table in soup.find_all("table"):
+        tbody = table.find("tbody")
+        if tbody is None or table.find("thead") is None:
+            continue
+        rows = tbody.find_all("tr", recursive=False)
+        if not rows:
+            continue
+        pages = {page_of.get(tr.get("id")) for tr in rows} - {None}
+        if len(pages) > 1:
+            out.append(table)
+            continue
+        hpage = _header_page(table, page_of)
+        fpage = page_of.get(rows[0].get("id"))
+        if hpage is not None and fpage is not None and hpage != fpage:
+            out.append(table)
+    return out
+
+
+def repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape):
+    # Assign a unique id to every body row and header row (the <thead> element
+    # itself is not reported by element_positions; its inner <tr> is).
+    ti = 0
+    for table in soup.find_all("table"):
+        tbody = table.find("tbody")
+        thead = table.find("thead")
+        if thead is not None and thead.find("tr") is not None:
+            thead.find("tr")["id"] = f"t{ti}h"
+        if tbody is not None:
+            for ri, tr in enumerate(tbody.find_all("tr", recursive=False)):
+                tr["id"] = f"t{ti}r{ri}"
+        ti += 1
+
+    capacity = page_content_height(landscape)
+
+    # Packing one table shifts everything after it, which can invalidate the
+    # keep-boundaries of downstream tables computed from the same measurement,
+    # so measure+pack until no table spans a page. Pinned chunks are stable
+    # anchors (they always start a fresh page), so this converges fast.
+    for _pass in range(MAX_CHUNK_ITERS):
+        page_of, height_of = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
+        spanning = _spanning_tables(soup, page_of)
+        if not spanning:
+            return
+        for table in spanning:
+            tbody = table.find("tbody")
+            thead = table.find("thead")
+            rows = tbody.find_all("tr", recursive=False)
+            htr = thead.find("tr")
+            header_h = height_of.get(htr.get("id") if htr else None, HEADER_H_FALLBACK)
+            avail = capacity - header_h - CHUNK_SLACK
+            # Rows that measured on the table's first page keep their place
+            # (they provably fit under the existing header today); the rest
+            # are packed into fresh full-page chunks by measured height. An
+            # orphaned header (thead alone at a page bottom) keeps nothing —
+            # every row is packed and the stranded header stub is removed.
+            first_page = page_of.get(rows[0].get("id"))
+            orphan = (_header_page(table, page_of) is not None
+                      and first_page is not None
+                      and _header_page(table, page_of) != first_page)
+            keep, rest = [], []
+            for tr in rows:
+                p = page_of.get(tr.get("id"))
+                if not orphan and not rest and p is not None and p == first_page:
+                    keep.append(tr)
+                else:
+                    rest.append(tr)
+            if not rest:
+                continue
+            groups, cur, cur_h = [], [], 0.0
+            for tr in rest:
+                h = height_of.get(tr.get("id"), LINE_H) + 1.0
+                if cur and cur_h + h > avail:
+                    groups.append(cur)
+                    cur, cur_h = [], 0.0
+                cur.append(tr)
+                cur_h += h
+            if cur:
+                groups.append(cur)
+            colgroup = table.find("colgroup")
+            anchor = table
+            for g in groups:
+                nt = soup.new_tag("table")
+                if colgroup is not None:
+                    nt.append(copy.copy(colgroup))
+                nthead = copy.copy(thead)
+                ntr = nthead.find("tr")
+                if ntr is not None and ntr.has_attr("id"):
+                    del ntr["id"]  # ids must stay unique
+                nt.append(nthead)
+                nb = soup.new_tag("tbody")
+                for tr in g:
+                    nb.append(tr.extract())
+                nt.append(nb)
+                wrapper = soup.new_tag("div", style="page-break-before: always")
+                wrapper.append(nt)
+                anchor.insert_after(wrapper)
+                anchor = wrapper
+            if orphan and not keep:
+                table.decompose()  # header-only stub left at the page bottom
+    print(f"WARNING: {doc_name}: table packing did not converge in "
+          f"{MAX_CHUNK_ITERS} passes; some table pages may lack a repeated "
+          f"header.", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# 5) Keep a section heading with its content: Story paginates greedily and will
+#    strand a heading alone at a page bottom when the block that follows it
+#    (paragraph, list, or — most visibly — a table) spills to the next page.
+#    This measures each heading's page vs. the START page of its immediate
+#    following block and, when the heading is stranded earlier, wraps it in a
+#    page-break-before div so it moves onto the page where its content begins.
+#    (Story reports a heading/paragraph/list by its own id but NOT a <table>'s;
+#    for a table the first BODY row's page is used as the content-start page.)
+#    Runs AFTER repeat_headers_across_pages (so it sees final table pagination),
+#    and verifies+reverts every move so a heading is never left worse off (alone
+#    on its own page) when its content genuinely cannot share the page.
+
+HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
+
+
+def _next_block_element(node):
+    """First following-sibling Tag of a heading (skips blank text nodes). A
+    non-blank bare text node returns None — it flows on the heading's own line
+    box, so it can't strand the heading."""
+    for sib in node.next_siblings:
+        if isinstance(sib, NavigableString):
+            if str(sib).strip() == "":
+                continue
+            return None
+        return sib
+    return None
+
+
+def _content_start_target(el):
+    """Element whose measured page marks where `el`'s content effectively STARTS.
+    Story does not report a <table>'s (or bare <div>'s) own id, so those map to a
+    reportable descendant. For a table prefer the first BODY row over the header
+    row: when a header squeezes onto the bottom of a page but the body spills
+    over, repeat_headers_across_pages pulls the whole table (header included) to
+    the next page — so the body row, not the header, predicts where the table
+    will actually begin. A <div> (e.g. a repeat_headers page-break wrapper) is
+    drilled the same way."""
+    if el.name in ("table", "div"):
+        tbody = el.find("tbody")
+        if tbody is not None and tbody.find("tr") is not None:
+            return tbody.find("tr")
+        tr = el.find("tr")
+        if tr is not None:
+            return tr
+        for d in el.descendants:
+            if getattr(d, "name", None) in ("p", "li", "pre", "blockquote",
+                                            "h1", "h2", "h3", "h4", "h5", "h6"):
+                return d
+        return None
+    return el
+
+
+def _is_pagebreak_div(el):
+    return (getattr(el, "name", None) == "div"
+            and "page-break-before" in (el.get("style") or ""))
+
+
+def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
+    """Move each stranded section heading onto the page where its content starts.
+    Run this AFTER repeat_headers_across_pages so it sees the final table
+    pagination (that pass's inserted page breaks are themselves a common cause of
+    freshly-stranded headings).
+
+    Every candidate move is applied, RE-MEASURED, and kept only if the heading
+    now shares a page with its content — otherwise reverted. This is essential:
+    when the following block is a table whose first row needs most of a page, a
+    plain page-break can never co-locate them and would only strand the heading
+    ALONE on its own page (worse than the original bottom-of-page orphan). Two
+    move shapes: if the content is a force-broken chunk (a page-break-before div
+    from repeat_headers), the heading is moved INSIDE it to ride the same break;
+    otherwise the heading is wrapped in its own page-break-before div."""
+    heads = soup.find_all(HEADING_TAGS)
+    for i, h in enumerate(heads):
+        if not h.get("id"):
+            h["id"] = f"kh{i}"
+    # `handled` = headings we've acted on (moved, or tried-and-reverted). A
+    # heading is added ONLY when acted on — never merely for being un-stranded in
+    # some pass — because a later move can strand a heading that was previously
+    # fine (moving a sub-heading down strands its parent). Those must stay
+    # eligible so the cascade is caught on a subsequent pass.
+    handled = set()
+    tc = 0
+    for _pass in range(2 * len(heads) + 5):
+        # (Re)map each still-eligible heading to the element that marks where its
+        # content starts, tagging that element with a measurable id.
+        targets = {}  # heading id -> (next-block element, content-start id)
+        for h in soup.find_all(HEADING_TAGS):
+            hid = h.get("id")
+            if hid in handled:
+                continue
+            nxt = _next_block_element(h)
+            if nxt is None:
+                handled.add(hid)           # nothing follows — nothing to do
+                continue
+            tgt = _content_start_target(nxt)
+            if tgt is None:
+                handled.add(hid)
+                continue
+            if not tgt.get("id"):
+                tgt["id"] = f"kht{tc}"
+                tc += 1
+            targets[hid] = (nxt, tgt["id"])
+        if not targets:
+            return
+        page_of, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
+
+        # First eligible heading that is stranded before its content. Un-stranded
+        # headings are skipped (NOT marked handled) so a later move can revisit.
+        cand = None
+        for h in soup.find_all(HEADING_TAGS):
+            hid = h.get("id")
+            if hid not in targets:
+                continue
+            nxt, tid = targets[hid]
+            hp, tp = page_of.get(hid), page_of.get(tid)
+            if hp is not None and tp is not None and hp < tp:
+                cand = (h, nxt, tid)
+                break
+        if cand is None:
+            return
+
+        h, nxt, tid = cand
+        if _is_pagebreak_div(nxt):
+            # Content is force-broken to a fresh page; ride along inside it so
+            # the heading sits at that page's top. This co-locates by
+            # construction (a heading is far shorter than a page), so keep it.
+            nxt.insert(0, h.extract())
+            handled.add(h["id"])
+            continue
+
+        # Otherwise give the heading its own page break, then verify it worked.
+        wrapper = soup.new_tag("div")
+        wrapper["style"] = "page-break-before: always"
+        h.wrap(wrapper)
+        page_of2, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
+        if page_of2.get(h["id"]) != page_of2.get(tid):
+            wrapper.unwrap()               # futile (content can't share the
+            #                                page, e.g. a page-tall first row) —
+            #                                leave the heading where it was.
+        handled.add(h["id"])               # acted on either way; don't retry
+    print(f"WARNING: {doc_name}: heading keep-with-next did not converge.",
+          file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Verification: silent row truncation is the failure mode of this layout
+# engine, so every rendered part is checked against canary needles (the first
+# cell of every body row).
+
+_LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl",
+              "ﬃ": "ffi", "ﬄ": "ffl"}
+
+
+def _normalize(s):
+    # Whitespace-free comparison form: a ZWSP soft break that actually wraps
+    # comes back from text extraction as a line break, so any whitespace
+    # difference between source and rendered text is layout, not loss.
+    for k, v in _LIGATURES.items():
+        s = s.replace(k, v)
+    return "".join(s.replace(ZWSP, "").split())
+
+
+def collect_row_needles(soup):
+    """Canaries against silent truncation: the head of every row's first cell
+    (a lost row loses it) and the tail of every long cell (a clipped over-tall
+    cell loses its tail but keeps the row's first cell)."""
+    needles = []
+    for table in soup.find_all("table"):
+        tbody = table.find("tbody")
+        if not tbody:
+            continue
+        for tr in tbody.find_all("tr", recursive=False):
+            tds = tr.find_all("td", recursive=False)
+            if not tds:
+                continue
+            t = _normalize(tds[0].get_text())[:24].strip()
+            if len(t) >= 4:
+                needles.append(t)
+            for td in tds:
+                full = _normalize(td.get_text())
+                if len(full) >= 120:
+                    needles.append(full[-24:])
+    return needles
+
+
+def verify_no_lost_rows(pdf_path, needles, doc_name):
+    doc = fitz.open(str(pdf_path))
+    text = _normalize(" ".join(page.get_text() for page in doc))
+    doc.close()
+    missing = [n for n in needles if n not in text]
+    if missing:
+        raise RuntimeError(
+            f"{doc_name}: {len(missing)} table row(s) missing from the "
+            f"rendered PDF (silent truncation?): {missing[:5]!r}...")
+
+
+def verify_margins(pdf_path, doc_name, tolerance=8):
+    doc = fitz.open(str(pdf_path))
+    worst = 0.0
+    for page in doc:
+        limit = page.rect.width - PAGE_MARGIN + tolerance
+        for w in page.get_text("words"):
+            if w[2] > limit:
+                worst = max(worst, w[2] - (page.rect.width - PAGE_MARGIN))
+    doc.close()
+    if worst:
+        print(f"WARNING: {doc_name}: text extends {worst:.1f}pt past the "
+              f"right margin", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+
+def prepare_tables(soup, landscape):
+    for table in soup.find_all("table"):
+        for cell in table.find_all(["td", "th"]):
+            inject_soft_breaks(cell)
+        widths = compute_column_weights(table, landscape)
+        if widths is None:
+            continue
+        set_colgroup(table, soup, widths)
+        split_overlong_cells(table, soup, widths, landscape)
+
+
+def render_story_to_pdf(html, css, mediabox, out_path, doc_name="?"):
+    story = fitz.Story(html=html, user_css=css)
+    writer = fitz.DocumentWriter(str(out_path))
+    where = mediabox + (PAGE_MARGIN, PAGE_MARGIN, -PAGE_MARGIN, -PAGE_MARGIN)
+    more = True
+    pages = 0
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev)
+        writer.end_page()
+        pages += 1
+        if pages > MAX_PAGES_PER_DOC:
+            writer.close()
+            raise RuntimeError(
+                f"{doc_name}: exceeded {MAX_PAGES_PER_DOC} pages — layout loop?")
+    writer.close()
+
+
+def toc_line(entry):
+    # Must match exactly what's rendered in the TOC <li> (single spaces only --
+    # HTML collapses repeated whitespace, so search_for() on the rendered PDF
+    # text would miss a line built with double spaces/em dashes).
+    line = f"{entry['num']}. {entry['full']} ({entry['acr']})"
+    if entry.get("page") is not None:
+        line += f" - p. {entry['page']}"
+    return line
+
+
+def toc_search_snippet(entry):
+    # search_for() does exact text matching against the PDF's extracted text,
+    # which uses ligature glyphs (e.g. "fi" -> single U+FB01 character) for
+    # titles like "Specification"/"Configuration" -- a plain "fi" substring
+    # never matches those. Acronyms never contain "fi", so anchor the link on
+    # the ligature-free "(ACR) - p. N" tail instead of the full title line.
+    return f"({entry['acr']}) - p. {entry['page']}"
+
+
+def build_toc_html(leaf_entries):
+    rows = []
+    last_part = None
+    for entry in leaf_entries:
+        if entry["part_title"] != last_part:
+            if last_part is not None:
+                rows.append("</ul>")
+            rows.append(f"<h3>{entry['part_title']}</h3><ul>")
+            last_part = entry["part_title"]
+        rows.append(f"<li>{toc_line(entry)}</li>")
+    if last_part is not None:
+        rows.append("</ul>")
+    return "".join(rows)
+
+
+def build_cover_html(toc_html, title, subtitle=None, cover_lines=()):
+    import html as _html
+    sub = f"<h2>{_html.escape(subtitle)}</h2>" if subtitle else ""
+    lines = "".join(f"<p>{_html.escape(str(l))}</p>" for l in (cover_lines or ()))
+    return f"""
+    <html><body>
+    <div>
+    <h1>{_html.escape(title)}</h1>
+    {sub}
+    {lines}
+    </div>
+    <div style="page-break-before: always;">
+    <h2>Table of Contents</h2>
+    {toc_html}
+    </div>
+    </body></html>
+    """
+
+
+def add_toc_links(pdf_path, leaf_entries, front_matter_pages):
+    """Adds clickable GoTo link annotations over each TOC line, plus a PDF
+    bookmark outline per entry, so the TOC is navigable both inline and via
+    the viewer's sidebar."""
+    doc = fitz.open(str(pdf_path))
+    toc_outline = []
+    for entry in leaf_entries:
+        target_index = entry["page"] - 1
+        # Prefer matching the full line (bigger clickable area); some titles
+        # contain an "fi"/"fl" ligature glyph that breaks exact-text matching,
+        # so fall back to the ligature-free "(ACR) - p. N" tail.
+        candidates = [toc_line(entry), toc_search_snippet(entry)]
+        found = False
+        for pno in range(front_matter_pages):
+            page = doc[pno]
+            for candidate in candidates:
+                rects = page.search_for(candidate)
+                if rects:
+                    for rect in rects:
+                        page.insert_link({
+                            "kind": fitz.LINK_GOTO,
+                            "page": target_index,
+                            "to": fitz.Point(0, 0),
+                            "from": rect,
+                        })
+                        found = True
+                    break
+        if not found:
+            print(f"WARNING: could not locate TOC line for link: {toc_line(entry)!r}", file=sys.stderr)
+        toc_outline.append([1, f"{entry['num']}. {entry['full']} ({entry['acr']})", entry["page"]])
+    doc.set_toc(toc_outline)
+    tmp_out = pdf_path.with_suffix(".linked.pdf")
+    doc.save(str(tmp_out), garbage=3, deflate=True)
+    doc.close()
+    tmp_out.replace(pdf_path)
+
+
+# ===========================================================================
+# Public API
+# ===========================================================================
+
+def render_markdown_file(src_md, out_pdf, *, landscape=False, base_css=None):
+    """Render ONE Markdown file to a standalone PDF (same table/heading engine,
+    no cover/TOC). Returns the page count."""
+    src_md, out_pdf = Path(src_md), Path(out_pdf)
+    css = (base_css or BASE_CSS).replace(
+        "{SIZE}", "Letter landscape" if landscape else "Letter")
+    mediabox = fitz.paper_rect("letter-l" if landscape else "letter")
+    raw = src_md.read_text(encoding="utf-8")
+    full_html = f"<html><body><div>{md_to_html(raw)}</div></body></html>"
+    name = src_md.name
+    with tempfile.TemporaryDirectory(prefix="mdpdf_",
+                                     ignore_cleanup_errors=True) as tmp:
+        tmpdir = Path(tmp)
+        soup = BeautifulSoup(full_html, "html.parser")
+        prepare_tables(soup, landscape)
+        needles = collect_row_needles(soup)
+        repeat_headers_across_pages(soup, css, mediabox, tmpdir, name, landscape)
+        keep_headings_with_next(soup, css, mediabox, tmpdir, name, landscape)
+        render_story_to_pdf(str(soup), css, mediabox, out_pdf, doc_name=name)
+        verify_no_lost_rows(out_pdf, needles, name)
+        verify_margins(out_pdf, name)
+    return len(PdfReader(str(out_pdf)).pages)
+
+
+def build_docset(structure, docs_dir, out_path, *, title,
+                 subtitle=None, cover_lines=(), base_css=None):
+    """Assemble `structure` (list of (part_title, [leaf, ...])) into one PDF at
+    `out_path`, with a cover, a linked TOC, and per-part section covers.
+    `docs_dir` is the base directory leaf filenames resolve against. Returns the
+    total page count."""
+    docs_dir, out_path = Path(docs_dir), Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # ignore_cleanup_errors: on Windows a raised layout error can leave
+    # _measure.pdf briefly locked; don't mask the real error with the cleanup.
+    with tempfile.TemporaryDirectory(prefix="docset_",
+                                     ignore_cleanup_errors=True) as tmp:
+        return _build(Path(tmp), structure, docs_dir, out_path,
+                      title, subtitle, cover_lines, base_css or BASE_CSS)
+
+
+def _build(tmpdir, structure, docs_dir, out_path, title, subtitle,
+           cover_lines, css_base):
+    portrait_box = fitz.paper_rect("letter")
+    landscape_box = fitz.paper_rect("letter-l")
+    css_portrait = css_base.replace("{SIZE}", "Letter")
+
+    def cover_pdf_for(part_title, acr, full):
+        return f"""<div>
+              <div class="cover-part">{part_title}</div>
+              <div class="cover-acronym">{acr}</div>
+              <div class="cover-full">{full}</div>
+              <hr/>
+            </div>"""
+
+    # Render every body part first so each one's page count is known before
+    # the Table of Contents (which needs real page numbers) is built.
+    leaf_entries = []
+    idx = 1
+    for part_title, docs in structure:
+        for num, acr, fname, full, landscape in docs:
+            fpath = docs_dir / fname
+            if not fpath.exists():
+                print(f"WARNING: missing {fpath}", file=sys.stderr)
+                continue
+            mediabox = landscape_box if landscape else portrait_box
+            leaf_out = tmpdir / f"{idx:02d}_{acr}.pdf"
+            css = css_base.replace(
+                "{SIZE}", "Letter landscape" if landscape else "Letter")
+
+            if fname.lower().endswith(".pdf"):
+                # Pre-rendered PDF leaf: render a cover page (section header +
+                # acronym + title, so it gets a TOC entry) and concatenate it
+                # in front of the supplied PDF. No markdown/table processing.
+                cover_html = f"<html><body>{cover_pdf_for(part_title, acr, full)}</body></html>"
+                cover_only = tmpdir / f"{idx:02d}_{acr}_cover.pdf"
+                render_story_to_pdf(cover_html, css, mediabox, cover_only, doc_name=acr)
+                w = PdfWriter()
+                for pf in (cover_only, fpath):
+                    for page in PdfReader(str(pf)).pages:
+                        w.add_page(page)
+                with open(leaf_out, "wb") as f:
+                    w.write(f)
+                leaf_entries.append({
+                    "part_title": part_title, "num": num, "acr": acr, "full": full,
+                    "path": leaf_out, "page": None,
+                })
+                idx += 1
+                continue
+
+            raw = fpath.read_text(encoding="utf-8")
+            cover = cover_pdf_for(part_title, acr, full)
+            full_html = f"<html><body>{cover}<div>{md_to_html(raw)}</div></body></html>"
+
+            soup = BeautifulSoup(full_html, "html.parser")
+            prepare_tables(soup, landscape)
+            needles = collect_row_needles(soup)
+            repeat_headers_across_pages(soup, css, mediabox, tmpdir, acr, landscape)
+            # After table splitting, so it sees the final pagination (the page
+            # breaks repeat_headers inserts are themselves a common cause of a
+            # freshly-stranded heading).
+            keep_headings_with_next(soup, css, mediabox, tmpdir, acr, landscape)
+
+            render_story_to_pdf(str(soup), css, mediabox, leaf_out, doc_name=acr)
+            verify_no_lost_rows(leaf_out, needles, acr)
+            verify_margins(leaf_out, acr)
+            leaf_entries.append({
+                "part_title": part_title, "num": num, "acr": acr, "full": full,
+                "path": leaf_out, "page": None,
+            })
+            idx += 1
+
+    def render_front_matter(cover_pdf):
+        render_story_to_pdf(
+            build_cover_html(build_toc_html(leaf_entries), title, subtitle, cover_lines),
+            css_portrait, portrait_box, cover_pdf, doc_name="cover/TOC")
+
+    # First pass: render the cover+TOC without page numbers just to learn how
+    # many pages the front matter itself takes up.
+    cover_pdf = tmpdir / "00_cover.pdf"
+    render_front_matter(cover_pdf)
+    front_matter_pages = len(PdfReader(str(cover_pdf)).pages)
+
+    # Now that the front-matter length is known, compute each entry's real
+    # starting page number in the final merged document.
+    page_num = front_matter_pages + 1
+    for entry in leaf_entries:
+        entry["page"] = page_num
+        page_num += len(PdfReader(str(entry["path"])).pages)
+
+    # Second pass: re-render cover+TOC with the real page numbers appended to
+    # each line. Sanity-check the front matter didn't grow/shrink a page --
+    # appending "- p. N" to existing lines shouldn't change line count, but
+    # warn rather than silently emit wrong link targets if it ever does.
+    render_front_matter(cover_pdf)
+    front_matter_pages2 = len(PdfReader(str(cover_pdf)).pages)
+    if front_matter_pages2 != front_matter_pages:
+        print(f"WARNING: TOC page count changed after adding page numbers "
+              f"({front_matter_pages} -> {front_matter_pages2}); TOC links may target the wrong page.",
+              file=sys.stderr)
+        front_matter_pages = front_matter_pages2
+
+    # Merge
+    writer = PdfWriter()
+    for pf in [cover_pdf] + [e["path"] for e in leaf_entries]:
+        reader = PdfReader(str(pf))
+        for page in reader.pages:
+            writer.add_page(page)
+    with open(out_path, "wb") as f:
+        writer.write(f)
+
+    # Add clickable TOC links + PDF bookmarks on the merged file.
+    add_toc_links(out_path, leaf_entries, front_matter_pages)
+
+    total_pages = len(PdfReader(str(out_path)).pages)
+    print(f"Wrote {out_path} ({total_pages} pages)")
+    return total_pages
+
+
+# ===========================================================================
+# Config loading + CLI
+# ===========================================================================
+
+def load_config(path):
+    """Parse a DOCSET JSON config. Paths (docs_dir, output, leaf files) resolve
+    relative to the config file's own directory unless absolute. Returns a dict:
+    {structure, docs_dir, out, title, subtitle, cover_lines}."""
+    import json
+    path = Path(path).resolve()
+    base = path.parent
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    docs_dir = base / cfg.get("docs_dir", "docs")
+    out = cfg.get("output") or cfg.get("out")
+    if not out:
+        raise ValueError(f"{path}: config needs an 'output' path")
+    out = Path(out)
+    if not out.is_absolute():
+        out = base / out
+    structure = []
+    for part in cfg["structure"]:
+        leaves = []
+        for d in part["docs"]:
+            leaves.append((str(d.get("num", "")), d["acr"], d["file"],
+                           d.get("title", d["acr"]), bool(d.get("landscape", False))))
+        structure.append((part["part"], leaves))
+    return {
+        "structure": structure, "docs_dir": docs_dir, "out": out,
+        "title": cfg.get("title", out.stem), "subtitle": cfg.get("subtitle"),
+        "cover_lines": cfg.get("cover_lines", []),
+    }
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage:\n"
+              "  python docset_builder.py <config.json>\n"
+              "  python docset_builder.py --single <in.md> <out.pdf> [--landscape]",
+              file=sys.stderr)
+        return 0 if argv[:1] in ([], ["--help"], ["-h"]) else 2
+
+    if argv[0] == "--single":
+        landscape = "--landscape" in argv
+        rest = [a for a in argv[1:] if a != "--landscape"]
+        if len(rest) != 2:
+            print("usage: --single <in.md> <out.pdf> [--landscape]", file=sys.stderr)
+            return 2
+        n = render_markdown_file(rest[0], rest[1], landscape=landscape)
+        print(f"Wrote {rest[1]} ({n} pages)")
+        return 0
+
+    cfg = load_config(argv[0])
+    build_docset(cfg["structure"], cfg["docs_dir"], cfg["out"],
+                 title=cfg["title"], subtitle=cfg["subtitle"],
+                 cover_lines=cfg["cover_lines"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

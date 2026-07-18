@@ -1,0 +1,26 @@
+{
+  "title": "MyProject",
+  "subtitle": "Consolidated Documentation Set",
+  "cover_lines": [
+    "One-line project description",
+    "Organization / owner"
+  ],
+  "docs_dir": "docs",
+  "output": "docs/MyProject-Documentation-Set.pdf",
+  "_notes": [
+    "Copy this file to your repo root as DOCSET.json and edit it. Paths resolve relative to this file's directory.",
+    "landscape:true for wide tables (>~6 columns) — column widths are computed automatically, so it's the only per-doc layout knob.",
+    "A 'file' ending in .pdf is a pre-rendered leaf: a section cover is prepended and the PDF concatenated as-is.",
+    "A 'file' may use '../' to reach a doc outside docs_dir. Any key starting with '_' is ignored by the engine.",
+    "Build with:  python <commands>/lib/docset_builder.py DOCSET.json   (or via the /build-docs command)."
+  ],
+  "structure": [
+    {"part": "1. Requirements", "docs": [
+      {"num": "1", "acr": "SRS", "file": "SRS.md", "title": "Software Requirements Specification", "landscape": false},
+      {"num": "2", "acr": "RTVM", "file": "RTVM.md", "title": "Requirements Traceability Matrix", "landscape": true}
+    ]},
+    {"part": "2. Design", "docs": [
+      {"num": "1", "acr": "SDD", "file": "SDD.md", "title": "Software Design Description", "landscape": true}
+    ]}
+  ]
+}

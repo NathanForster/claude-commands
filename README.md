@@ -12,6 +12,7 @@ These commands are designed to be dropped into any project and used across sessi
 | [`/icm-validate`](icm-validate.md) | Audit ICM requirement statuses against code and pipeline artifacts |
 | [`/session-close`](session-close.md) | Full end-of-session checklist — validate, test, document, commit |
 | [`/docs-review`](docs-review.md) | Deep review, cross-reference, and backfill of the docs folder, plus composite PDF rebuild |
+| [`/build-docs`](build-docs.md) | Build the consolidated documentation-set PDF (or render a single Markdown file) via the shared docset engine |
 | [`/run`](run.md) | Launch the project's app in a named mode, driven by a `RUN.md` mode registry |
 
 ## Installation
@@ -85,6 +86,19 @@ A deep review-and-update pass over every document in a project's `docs/` (or `do
 - **Composite PDF** — if the folder contains a combined PDF, locates its `.py` build script and re-runs it to regenerate the PDF.
 
 Pass a folder — `/docs-review documentation` — to target a specific directory and skip auto-detection.
+
+---
+
+### `/build-docs`
+
+Builds a project's **consolidated documentation-set PDF** — a single bookmarked file assembled from many Markdown docs, with a cover, a clickable table of contents, and per-part section covers. It can also render a **single** Markdown file to a standalone PDF (`/build-docs single <in.md> <out.pdf> [landscape]`).
+
+All the layout logic lives in one shared engine — [`lib/docset_builder.py`](lib/docset_builder.py) — so every project shares the same (heavily battle-tested) table pagination, column-width fitting, cross-page header repetition, keep-heading-with-content, and silent-truncation verification. Projects supply only *which* documents to include:
+
+- **Data-file form** — a `DOCSET.json` at the repo root (see [`lib/DOCSET.example.json`](lib/DOCSET.example.json)) listing the parts, documents, titles, and per-doc landscape flags. Run directly: `python lib/docset_builder.py DOCSET.json`.
+- **Build-script form** — a tiny `orchestrator/build_docset_pdf.py` (or similar) that imports the engine and loads the project's config. Keeping a `.py` entry point means `/docs-review` finds and runs it automatically.
+
+Requires `pymupdf`, `markdown-it-py`, `pypdf`, `beautifulsoup4` in the project's Python.
 
 ---
 
