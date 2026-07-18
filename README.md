@@ -100,6 +100,70 @@ All the layout logic lives in one shared engine — [`lib/docset_builder.py`](li
 
 Requires `pymupdf`, `markdown-it-py`, `pypdf`, `beautifulsoup4` in the project's Python.
 
+#### Adopting the docset builder in another project
+
+Paste the prompt below into a fresh Claude session **in the target project**. It is
+self-contained — it tells Claude to reference the shared engine (never copy it),
+propose a `DOCSET.json` from the project's own `docs/`, add a thin build script, and
+verify the result.
+
+````text
+Set this project up to build a consolidated documentation-set PDF using the shared
+docset engine (not a per-project copy).
+
+BACKGROUND
+- The shared engine lives in my Claude commands repo:
+  https://github.com/NathanForster/claude-commands  ->  lib/docset_builder.py
+- On this machine it should be at:  C:\.ai\.claude\commands\lib\docset_builder.py
+  If that file is missing, tell me and stop (I may need to `git pull` that repo).
+- It renders Markdown -> PDF with automatic table column-fitting, cross-page header
+  repetition, keep-heading-with-its-content, and silent-truncation verification.
+- Python deps (must be importable by the python you run): pymupdf, markdown-it-py,
+  pypdf, beautifulsoup4. If an import fails, report the missing package -- do NOT
+  hand-assemble a PDF.
+
+DO THIS
+1. Confirm the engine exists at one of: the CLAUDE_COMMANDS_LIB env var,
+   C:\.ai\.claude\commands\lib, or ~/.claude/commands/lib. Read its module
+   docstring for the current API/CLI.
+2. Inventory this project's docs/ folder. Propose a DOCSET.json structure --
+   grouped into logical "parts", each doc with num/acr/file/title and a
+   landscape flag (true only for wide tables, >~6 columns). SHOW me the proposed
+   structure and wait for my confirmation before writing anything. Don't guess
+   the order or invent documents.
+3. On my OK, write DOCSET.json at the repo root. Format:
+     {
+       "title": "...", "subtitle": "...", "cover_lines": ["...", "..."],
+       "docs_dir": "docs",
+       "output": "docs/<Project>-Documentation-Set.pdf",
+       "structure": [
+         {"part": "1. Requirements", "docs": [
+           {"num":"1","acr":"SRS","file":"SRS.md","title":"...","landscape":false}
+         ]}
+       ]
+     }
+   (A `file` ending in .pdf is concatenated as a pre-rendered leaf; `../` may reach
+   outside docs_dir; any key starting with `_` is ignored -- use `_notes` for
+   rationale. Template: C:\.ai\.claude\commands\lib\DOCSET.example.json)
+4. Add a thin build script at orchestrator/build_docset_pdf.py that locates the
+   shared engine (env CLAUDE_COMMANDS_LIB -> C:\.ai\.claude\commands\lib ->
+   ~/.claude/commands/lib), then calls
+   db.load_config('DOCSET.json') + db.build_docset(...). Keeping a .py entry point
+   means /docs-review and /build-docs find and run it. (Model it on FRIS_NET's
+   orchestrator/build_docset_pdf.py.)
+5. Build it, then VERIFY: exit 0, output PDF timestamp advanced, sane page count,
+   TOC entries present, and no `WARNING:` lines from the engine. Report those.
+
+Do not copy the engine into this repo -- reference the shared one only.
+````
+
+Notes:
+- If the project **already** has a combined PDF and its own build script, just run
+  `/build-docs` (or `/docs-review`) — it finds and runs the existing script instead
+  of duplicating setup.
+- For a **one-off single file**:
+  `python C:\.ai\.claude\commands\lib\docset_builder.py --single <in.md> <out.pdf> [--landscape]`
+
 ---
 
 ### `/run`
