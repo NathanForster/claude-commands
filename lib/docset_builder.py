@@ -878,6 +878,67 @@ def _merge_chunks(soup):
     return merged
 
 
+# ---------------------------------------------------------------------------
+# 7) Sparse-page packing: repeat_headers pins every table-continuation chunk (and
+#    a short section table forced fresh by a neighbour's pin) to a NEW page with
+#    `page-break-before: always`, so a small chunk can sit nearly alone on its
+#    page. This pulls such a chunk back onto the previous page when it PROVABLY
+#    fits there: drop the forced break, re-measure, and keep the change only if no
+#    table row then spans a page (else revert). The repeated header rides with the
+#    chunk, so it simply reappears mid-page. Verification-based like the widow
+#    pass, and safe against Story's mid-page-break placement loop — a runaway
+#    re-measure is caught and treated as "does not fit". Runs LAST, after the
+#    chunk/heading/widow layout has settled, so it only tightens whitespace.
+
+def pack_sparse_pages(soup, css, mediabox, tmpdir, doc_name, landscape):
+    capacity = page_content_height(landscape)
+    changed = False
+    wrappers = [w for w in soup.find_all("div")
+                if "page-break-before" in (w.get("style") or "")
+                and w.find("table") is not None]
+    for w in wrappers:
+        ids = [tr.get("id") for tr in w.find_all("tr") if tr.get("id")]
+        if not ids:
+            continue
+        page_of, top_of, bot_of = _measure_pos(str(soup), css, mediabox, tmpdir, doc_name)
+        if any(i not in page_of for i in ids):
+            continue
+        my_page = min(page_of[i] for i in ids)
+        if my_page == 0:
+            continue
+        prev_bottoms = [bot_of[i] for i, pg in page_of.items()
+                        if pg == my_page - 1 and i in bot_of]
+        if not prev_bottoms:
+            continue
+        used = max(prev_bottoms) - CONTENT_TOP
+        have_top = [top_of[i] for i in ids if i in top_of]
+        have_bot = [bot_of[i] for i in ids if i in bot_of]
+        if not have_top or not have_bot:
+            continue
+        chunk_h = max(have_bot) - min(have_top)
+        # the cloned header carries no id, so pad for it plus the pin slack
+        need = chunk_h + HEADER_H_FALLBACK + CHUNK_SLACK
+        if used + need > capacity:
+            continue                       # won't fit on the previous page
+        orig = w["style"]
+        rest = "; ".join(s.strip() for s in orig.split(";")
+                         if s.strip() and "page-break-before" not in s)
+        if rest:
+            w["style"] = rest
+        else:
+            del w["style"]
+        try:
+            pg2, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
+            bad = bool(_spanning_tables(soup, pg2))
+        except RuntimeError:
+            bad = True                     # mid-page break loop -> it did not fit
+        if bad:
+            w["style"] = orig              # revert
+        else:
+            changed = True
+    return changed
+
+
 def paginate(soup, css, mediabox, tmpdir, doc_name, landscape):
     """Settle table chunking, heading-keep, and widow reflow together. Each pass
     can invalidate the others' measurements (a heading/widow page break shifts a
@@ -893,9 +954,11 @@ def paginate(soup, css, mediabox, tmpdir, doc_name, landscape):
         c2 = keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape)
         c3 = fix_paragraph_widows(soup, widow_blocks, css, mediabox, tmpdir, doc_name, landscape)
         if not (c2 or c3):
+            pack_sparse_pages(soup, css, mediabox, tmpdir, doc_name, landscape)
             return
     print(f"WARNING: {doc_name}: pagination did not converge in "
           f"{MAX_PAGINATE_ITERS} passes", file=sys.stderr)
+    pack_sparse_pages(soup, css, mediabox, tmpdir, doc_name, landscape)
 
 
 # ---------------------------------------------------------------------------
