@@ -113,6 +113,10 @@ COL_OVERHEAD = 8.9
 TABLE_SLACK = 2.0
 MAX_SOFT_RUN = 12            # longest whitespace-free run allowed in a cell
 MAX_CHUNK_ITERS = 12
+MAX_PAGINATE_ITERS = 8       # outer table/heading/widow convergence loop
+BODY_LINE_H = 14.2           # body-text baseline step (10.5px * 1.35)
+WIDOW_TAIL_MAX = 2.4 * BODY_LINE_H   # reflow a paragraph only if <= ~2 lines spill
+CONTENT_TOP = PAGE_MARGIN + BODY_MARGIN   # y where page content begins (46.5)
 
 ZWSP = "​"
 # Preferred soft-break points inside long tokens (break AFTER these chars).
@@ -481,6 +485,7 @@ def repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape
     for table in soup.find_all("table"):
         tbody = table.find("tbody")
         thead = table.find("thead")
+        table["id"] = f"tbl{ti}"
         if thead is not None and thead.find("tr") is not None:
             thead.find("tr")["id"] = f"t{ti}h"
         if tbody is not None:
@@ -489,6 +494,7 @@ def repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape
         ti += 1
 
     capacity = page_content_height(landscape)
+    changed = False
 
     # Packing one table shifts everything after it, which can invalidate the
     # keep-boundaries of downstream tables computed from the same measurement,
@@ -498,7 +504,7 @@ def repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape
         page_of, height_of = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
         spanning = _spanning_tables(soup, page_of)
         if not spanning:
-            return
+            return changed
         for table in spanning:
             tbody = table.find("tbody")
             thead = table.find("thead")
@@ -524,6 +530,7 @@ def repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape
                     rest.append(tr)
             if not rest:
                 continue
+            changed = True
             groups, cur, cur_h = [], [], 0.0
             for tr in rest:
                 h = height_of.get(tr.get("id"), LINE_H) + 1.0
@@ -550,6 +557,12 @@ def repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape
                     nb.append(tr.extract())
                 nt.append(nb)
                 wrapper = soup.new_tag("div", style="page-break-before: always")
+                # Tag non-orphan chunks with their source table id so paginate can
+                # merge them back and re-pack from whole tables next pass (the
+                # source survives; an orphan's source is decomposed, so its chunks
+                # are left final/untagged).
+                if not orphan:
+                    wrapper["data-chunk"] = table.get("id", "")
                 wrapper.append(nt)
                 anchor.insert_after(wrapper)
                 anchor = wrapper
@@ -558,6 +571,7 @@ def repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape
     print(f"WARNING: {doc_name}: table packing did not converge in "
           f"{MAX_CHUNK_ITERS} passes; some table pages may lack a repeated "
           f"header.", file=sys.stderr)
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +656,7 @@ def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
     # fine (moving a sub-heading down strands its parent). Those must stay
     # eligible so the cascade is caught on a subsequent pass.
     handled = set()
+    changed = False
     tc = 0
     for _pass in range(2 * len(heads) + 5):
         # (Re)map each still-eligible heading to the element that marks where its
@@ -664,7 +679,7 @@ def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
                 tc += 1
             targets[hid] = (nxt, tgt["id"])
         if not targets:
-            return
+            return changed
         page_of, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
 
         # First eligible heading that is stranded before its content. Un-stranded
@@ -680,7 +695,7 @@ def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
                 cand = (h, nxt, tid)
                 break
         if cand is None:
-            return
+            return changed
 
         h, nxt, tid = cand
         if _is_pagebreak_div(nxt):
@@ -689,6 +704,7 @@ def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
             # construction (a heading is far shorter than a page), so keep it.
             nxt.insert(0, h.extract())
             handled.add(h["id"])
+            changed = True
             continue
 
         # Otherwise give the heading its own page break, then verify it worked.
@@ -700,9 +716,186 @@ def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
             wrapper.unwrap()               # futile (content can't share the
             #                                page, e.g. a page-tall first row) —
             #                                leave the heading where it was.
+        else:
+            changed = True
         handled.add(h["id"])               # acted on either way; don't retry
     print(f"WARNING: {doc_name}: heading keep-with-next did not converge.",
           file=sys.stderr)
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# 6) Widow control for body paragraphs: Story splits a paragraph greedily and can
+#    leave its final line or two alone at the top of the next page (a widow). The
+#    last word of each paragraph is wrapped in a measurable <span>; if a paragraph
+#    spills only a short tail (<= ~2 lines) AND the whole paragraph would then fit
+#    on one page, it is pushed onto the next page so it stays intact. Every push is
+#    re-measured and reverted if it fails to un-split the paragraph.
+
+def _measure_pos(html, css, mediabox, tmpdir, doc_name):
+    """Like measure_rows but also records each id's top (r[1]) and bottom (r[3]) y
+    on the page it first opens. Returns (page_of, top_of, bot_of)."""
+    story = fitz.Story(html=html, user_css=css)
+    out = tmpdir / "_measure.pdf"
+    writer = fitz.DocumentWriter(str(out))
+    where = mediabox + (PAGE_MARGIN, PAGE_MARGIN, -PAGE_MARGIN, -PAGE_MARGIN)
+    page_of, top_of, bot_of = {}, {}, {}
+
+    def cb(pos):
+        if pos.id and (pos.open_close & 1) and pos.id not in page_of:
+            page_of[pos.id] = pos.page_num
+            r = getattr(pos, "rect", None)
+            if r is not None:
+                top_of[pos.id] = r[1]
+                bot_of[pos.id] = r[3]
+
+    more, page = True, 0
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.element_positions(cb, {"page_num": page})
+        story.draw(dev)
+        writer.end_page()
+        page += 1
+        if page > MAX_PAGES_PER_DOC:
+            writer.close()
+            raise RuntimeError(f"{doc_name}: widow measurement exceeded "
+                               f"{MAX_PAGES_PER_DOC} pages")
+    writer.close()
+    return page_of, top_of, bot_of
+
+
+def _wrap_last_word(el, soup, span_id):
+    """Wrap the last word of a block in <span id=span_id> so where it ENDS can be
+    measured. Returns span_id, or None if there is nothing to wrap."""
+    texts = [t for t in el.descendants
+             if isinstance(t, NavigableString) and t.strip()]
+    if not texts:
+        return None
+    last = texts[-1]
+    s = str(last)
+    stripped = s.rstrip()
+    trail = s[len(stripped):]
+    head, _, word = stripped.rpartition(" ")
+    span = soup.new_tag("span", id=span_id)
+    span.string = word + trail
+    if head:
+        new_head = NavigableString(head + " ")
+        last.replace_with(new_head)
+        new_head.insert_after(span)
+    else:
+        last.replace_with(span)
+    return span_id
+
+
+def _tag_widow_blocks(soup):
+    """Tag every non-empty <p> with an id and wrap its last word in a <span id>.
+    Done once, before the pagination loop. Returns [(para_id, word_id), ...]."""
+    blocks = []
+    wi = 0
+    for el in soup.find_all("p"):
+        if not el.get_text(strip=True):
+            continue
+        wid = _wrap_last_word(el, soup, f"ww{wi}")
+        if wid is None:
+            continue
+        if not el.get("id"):
+            el["id"] = f"wp{wi}"
+        blocks.append((el["id"], wid))
+        wi += 1
+    return blocks
+
+
+def fix_paragraph_widows(soup, blocks, css, mediabox, tmpdir, doc_name, landscape):
+    if not blocks:
+        return False
+    capacity = page_content_height(landscape)
+    changed = False
+    handled = set()
+    for _pass in range(len(blocks) + 5):
+        page_of, top_of, bot_of = _measure_pos(
+            str(soup), css, mediabox, tmpdir, doc_name)
+        cand = None
+        for pid, wid in blocks:
+            if pid in handled:
+                continue
+            pp, wp = page_of.get(pid), page_of.get(wid)
+            if pp is None or wp is None or wp <= pp:
+                continue                       # doesn't span a page
+            tail = bot_of.get(wid, CONTENT_TOP) - CONTENT_TOP
+            first_portion = bot_of.get(pid, 0.0) - top_of.get(pid, 0.0)
+            if tail > WIDOW_TAIL_MAX or first_portion + tail > capacity - CHUNK_SLACK:
+                handled.add(pid)               # real multi-line split, or too tall
+                continue
+            cand = (pid, wid)
+            break
+        if cand is None:
+            break
+        pid, wid = cand
+        el = soup.find(id=pid)
+        if el is None:
+            handled.add(pid)
+            continue
+        wrapper = soup.new_tag("div", style="page-break-before: always")
+        el.wrap(wrapper)
+        page_of2, _, _ = _measure_pos(str(soup), css, mediabox, tmpdir, doc_name)
+        if page_of2.get(pid) != page_of2.get(wid):
+            wrapper.unwrap()                   # still split — revert
+        else:
+            changed = True
+        handled.add(pid)
+    return changed
+
+
+def _merge_chunks(soup):
+    """Undo non-orphan table chunking from a prior repeat_headers pass: move each
+    chunk's rows back into its source table's tbody and drop the wrapper, so the
+    next pass re-packs from whole tables. (Re-chunking an already-chunked table is
+    what strands rows one-per-page: each pass peels a single-row chunk that never
+    recombines with the earlier ones.) A heading that keep_headings tucked into a
+    chunk is lifted out but kept on its forced page via its own page-break div, so
+    its placement survives the round-trip. Returns whether anything was merged."""
+    merged = False
+    for wrap in soup.find_all("div", attrs={"data-chunk": True}):
+        src = soup.find("table", id=wrap.get("data-chunk"))
+        chunk = wrap.find("table")
+        if src is None or chunk is None:
+            continue
+        for child in list(wrap.children):
+            if getattr(child, "name", None) == "table":
+                continue
+            if getattr(child, "name", None) is None and not str(child).strip():
+                continue
+            pb = soup.new_tag("div", style="page-break-before: always")
+            pb.append(child.extract())
+            wrap.insert_before(pb)
+        src_body, cbody = src.find("tbody"), chunk.find("tbody")
+        if src_body is not None and cbody is not None:
+            for tr in cbody.find_all("tr", recursive=False):
+                src_body.append(tr.extract())
+        wrap.decompose()
+        merged = True
+    return merged
+
+
+def paginate(soup, css, mediabox, tmpdir, doc_name, landscape):
+    """Settle table chunking, heading-keep, and widow reflow together. Each pass
+    can invalidate the others' measurements (a heading/widow page break shifts a
+    table so its rows re-span; table chunks shift a heading or paragraph so it
+    strands), so iterate: reset table chunking, re-pack every spanning table whole
+    (repeated header on each continuation), then re-place stranded headings and
+    widowed paragraphs. Converges when neither headings nor widows move — at which
+    point the (deterministic) table packing is stable too."""
+    widow_blocks = _tag_widow_blocks(soup)
+    for _ in range(MAX_PAGINATE_ITERS):
+        _merge_chunks(soup)
+        repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape)
+        c2 = keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape)
+        c3 = fix_paragraph_widows(soup, widow_blocks, css, mediabox, tmpdir, doc_name, landscape)
+        if not (c2 or c3):
+            return
+    print(f"WARNING: {doc_name}: pagination did not converge in "
+          f"{MAX_PAGINATE_ITERS} passes", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -913,8 +1106,7 @@ def render_markdown_file(src_md, out_pdf, *, landscape=False, base_css=None):
         soup = BeautifulSoup(full_html, "html.parser")
         prepare_tables(soup, landscape)
         needles = collect_row_needles(soup)
-        repeat_headers_across_pages(soup, css, mediabox, tmpdir, name, landscape)
-        keep_headings_with_next(soup, css, mediabox, tmpdir, name, landscape)
+        paginate(soup, css, mediabox, tmpdir, name, landscape)
         render_story_to_pdf(str(soup), css, mediabox, out_pdf, doc_name=name)
         verify_no_lost_rows(out_pdf, needles, name)
         verify_margins(out_pdf, name)
@@ -993,11 +1185,7 @@ def _build(tmpdir, structure, docs_dir, out_path, title, subtitle,
             soup = BeautifulSoup(full_html, "html.parser")
             prepare_tables(soup, landscape)
             needles = collect_row_needles(soup)
-            repeat_headers_across_pages(soup, css, mediabox, tmpdir, acr, landscape)
-            # After table splitting, so it sees the final pagination (the page
-            # breaks repeat_headers inserts are themselves a common cause of a
-            # freshly-stranded heading).
-            keep_headings_with_next(soup, css, mediabox, tmpdir, acr, landscape)
+            paginate(soup, css, mediabox, tmpdir, acr, landscape)
 
             render_story_to_pdf(str(soup), css, mediabox, leaf_out, doc_name=acr)
             verify_no_lost_rows(leaf_out, needles, acr)
