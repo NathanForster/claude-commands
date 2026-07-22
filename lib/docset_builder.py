@@ -58,7 +58,11 @@ the installed PyMuPDF Story engine before being relied on):
     Story.element_positions during a measurement render; note the measurement
     loop MUST draw each placed page into a real DocumentWriter -- place()
     alone does not advance the story (this, not table layout per se, is what
-    previously looked like a "no-progress oscillation").
+    previously looked like a "no-progress oscillation"). The measurement hands
+    Story a whole UNCHUNKED table, so it can still hit that same mid-page-break
+    loop at unlucky vertical offsets (e.g. a doc's leading section cover shifts a
+    long table down just enough); measure_rows detects the stall and falls back
+    to a stall-proof tall-page measurement (_measure_tall) rather than looping.
 """
 import copy
 import sys
@@ -417,10 +421,46 @@ CHUNK_SLACK = 30.0     # margins/borders headroom per pinned chunk, pt
 HEADER_H_FALLBACK = 18.0
 
 
+# Consecutive placed pages that add no new element (while Story still reports
+# more content) before the measurement is judged stalled. Real flow lands at
+# least one id-bearing block per page and every row/header is < half a page, so
+# a run this long with no progress is Story's mid-page table-break loop, not a
+# genuinely tall element. A false positive is harmless — the fallback yields the
+# same heights and equally usable page numbers — so this can be generous.
+STALL_PAGES = 5
+
+# Height of a measurement "tall page", in real pages. Placing the whole document
+# onto pages this tall means Story almost never has to break a table across a
+# page (the operation it loops on), while staying well under any renderer page-
+# size limit. Documents taller than this still measure correctly (content spills
+# onto a second tall page; see _measure_tall).
+TALL_PAGE_MULT = 64
+
+
 def measure_rows(html, css, mediabox, tmpdir, doc_name):
-    """Renders to a throwaway PDF recording each element id's first page and
-    its rect height. The draw() into a real DocumentWriter is REQUIRED:
-    place() alone never advances the story."""
+    """Record each element id's first page and its rect height.
+
+    Normally Story is left to paginate at the real page size (_measure_paginated).
+    But PyMuPDF's Story cannot reliably break a table across a page at certain
+    vertical offsets: it stops making forward progress and would emit blank pages
+    up to the guard limit (the same mid-page-break loop the assembly path avoids
+    by pre-chunking tables — it can still bite the *measurement*, which hands
+    Story a whole unchunked table). When that stall is detected, fall back to a
+    stall-proof tall-page measurement that never asks Story to break a table."""
+    result = _measure_paginated(html, css, mediabox, tmpdir, doc_name)
+    if result is not None:
+        return result
+    print(f"WARNING: {doc_name}: Story stalled paginating a table during "
+          f"measurement; using tall-page fallback.", file=sys.stderr)
+    return _measure_tall(html, css, mediabox, tmpdir)
+
+
+def _measure_paginated(html, css, mediabox, tmpdir, doc_name):
+    """Real-page-size measurement: render to a throwaway PDF and record each id's
+    first page and height. The draw() into a real DocumentWriter is REQUIRED:
+    place() alone never advances the story. Returns (page_of, height_of), or None
+    if Story stalled (STALL_PAGES pages with no forward progress) so measure_rows
+    can fall back."""
     story = fitz.Story(html=html, user_css=css)
     out = tmpdir / "_measure.pdf"
     writer = fitz.DocumentWriter(str(out))
@@ -434,19 +474,104 @@ def measure_rows(html, css, mediabox, tmpdir, doc_name):
             if r is not None:
                 height_of[pos.id] = r[3] - r[1]
 
-    more, page = True, 0
+    more, page, stalled = True, 0, 0
     while more:
+        prev = len(page_of)
         dev = writer.begin_page(mediabox)
         more, _ = story.place(where)
         story.element_positions(cb, {"page_num": page})
         story.draw(dev)
         writer.end_page()
         page += 1
+        # Forward-progress guard. Only after the first element has landed: a
+        # leading id-less cover/title page legitimately places no id.
+        if more and page_of and len(page_of) == prev:
+            stalled += 1
+            if stalled >= STALL_PAGES:
+                writer.close()
+                return None
+        else:
+            stalled = 0
         if page > MAX_PAGES_PER_DOC:
             writer.close()
             raise RuntimeError(f"{doc_name}: measurement pass exceeded "
                                f"{MAX_PAGES_PER_DOC} pages")
     writer.close()
+    return page_of, height_of
+
+
+def _measure_tall(html, css, mediabox, tmpdir):
+    """Stall-proof measurement. Placing the document onto very tall pages means
+    Story almost never has to break a table across a page (the operation it loops
+    on), so every element lands with a real, position-independent height (column
+    widths are fixed, so these heights match the real layout exactly). Per-element
+    page numbers are then reconstructed by greedy row-quantized pagination over
+    those heights using the same per-page capacity the packer uses. The result
+    matches real pagination up to an occasional 1-page offset between tables,
+    which preserves every within-table span/keep decision the packer reads from
+    it — and the packing loop re-measures the chunked document at the real page
+    size next pass, where it no longer stalls, to converge exactly."""
+    capacity = mediabox.height - 2 * PAGE_MARGIN - 2 * BODY_MARGIN
+    tall = fitz.Rect(mediabox.x0, mediabox.y0,
+                     mediabox.x1, mediabox.y0 + mediabox.height * TALL_PAGE_MULT)
+    per_tall = tall.height - 2 * PAGE_MARGIN - 2 * BODY_MARGIN  # content per tall page
+    story = fitz.Story(html=html, user_css=css)
+    writer = fitz.DocumentWriter(str(tmpdir / "_measure_tall.pdf"))
+    where = tall + (PAGE_MARGIN, PAGE_MARGIN, -PAGE_MARGIN, -PAGE_MARGIN)
+    rec = {}  # id -> (absolute top y, absolute bottom y) down the whole document
+
+    def cb(pos):
+        if pos.id and (pos.open_close & 1) and pos.id not in rec:
+            r = getattr(pos, "rect", None)
+            if r is not None:
+                base = pos.page_num * per_tall
+                rec[pos.id] = (base + r[1], base + r[3])
+
+    more, page = True, 0
+    while more:
+        dev = writer.begin_page(tall)
+        more, _ = story.place(where)
+        story.element_positions(cb, {"page_num": page})
+        story.draw(dev)
+        writer.end_page()
+        page += 1
+        if page > MAX_PAGES_PER_DOC:  # each tall page ~= TALL_PAGE_MULT real pages
+            writer.close()
+            raise RuntimeError("tall-page measurement overran")
+    writer.close()
+
+    height_of = {eid: bot - top for eid, (top, bot) in rec.items()}
+    # Walk real flow elements in document order, greedily quantizing to pages.
+    # Exclude any element that geometrically ENCLOSES another (a table container
+    # spans all its rows); counting it would double the height of its rows.
+    ids = list(rec)
+    enclosing = set()
+    for a in ids:
+        at, ab = rec[a]
+        for b in ids:
+            if a is b:
+                continue
+            bt, bb = rec[b]
+            if at <= bt and ab >= bb and (at < bt or ab > bb):
+                enclosing.add(a)
+                break
+    flow = sorted((e for e in ids if e not in enclosing), key=lambda e: rec[e][0])
+    page_of = {}
+    page_num, page_top = 0, None
+    for eid in flow:
+        top, bot = rec[eid]
+        if page_top is None:
+            page_top = top
+        elif bot - page_top > capacity:
+            page_num += 1
+            page_top = top
+        page_of[eid] = page_num
+    # Enclosing containers were skipped above; give each the page where its own
+    # span begins so any lookup still resolves sensibly.
+    for eid in enclosing:
+        top = rec[eid][0]
+        page_of[eid] = next((page_of[f] for f in flow if rec[f][0] >= top - 0.5),
+                            page_of.get(flow[-1], 0) if flow else 0)
     return page_of, height_of
 
 
