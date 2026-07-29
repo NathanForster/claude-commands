@@ -1154,6 +1154,112 @@ def pack_sparse_pages(soup, css, mediabox, tmpdir, doc_name, landscape):
     return changed
 
 
+# ---------------------------------------------------------------------------
+# 8) Tail-pull: a near-empty page arises when a section's LAST short block(s)
+#    land alone on a page because everything after them is force-broken to a
+#    fresh page (observed in the FRIS docset: an SRS page holding one
+#    "Qualification:" line; an STR page holding just "None."). For each
+#    SECTION-START page-break wrapper (first child a heading, or a separator
+#    then a heading — never a table-continuation chunk, which would interleave
+#    text into a split table), move up to two short immediately-preceding
+#    blocks INSIDE the wrapper, before its content, so they open the next page
+#    instead. Any heading this re-strands is pulled along by the
+#    keep-headings requeue on the next paginate iteration. Verification-based:
+#    each move is kept only if the document's rendered page count DECREASES.
+
+TAIL_TAGS = ("p", "ul", "ol", "pre", "blockquote")
+TAIL_MAX_CHARS = 300
+
+
+def _render_page_count(html, css, mediabox, tmpdir):
+    story = fitz.Story(html=html, user_css=css)
+    out = tmpdir / "_measure_pages.pdf"
+    writer = fitz.DocumentWriter(str(out))
+    where = mediabox + (PAGE_MARGIN, PAGE_MARGIN, -PAGE_MARGIN, -PAGE_MARGIN)
+    more, pages = True, 0
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev)
+        writer.end_page()
+        pages += 1
+        if pages > 2000:                   # runaway guard
+            break
+    writer.close()
+    return pages
+
+
+def _first_content_child(w):
+    for c in w.children:
+        if isinstance(c, NavigableString):
+            if str(c).strip() == "":
+                continue
+            return None
+        return c
+    return None
+
+
+def _is_section_start_wrapper(w):
+    first = _first_content_child(w)
+    if first is None:
+        return False
+    if first.name == "hr":
+        nxt = _next_block_element(first)
+        return getattr(nxt, "name", None) in HEADING_TAGS
+    return first.name in HEADING_TAGS
+
+
+def _prev_content_sibling(node):
+    for sib in node.previous_siblings:
+        if isinstance(sib, NavigableString):
+            if str(sib).strip() == "":
+                continue
+            return None
+        return sib
+    return None
+
+
+def pull_short_tails(soup, css, mediabox, tmpdir, doc_name, landscape):
+    changed = False
+    wrappers = [w for w in soup.find_all("div")
+                if "page-break-before" in (w.get("style") or "")
+                and _is_section_start_wrapper(w)]
+    for w in wrappers:
+        # Collect up to 2 short blocks sitting immediately before the wrapper.
+        tail = []
+        node = w
+        while len(tail) < 2:
+            prev = _prev_content_sibling(node)
+            if prev is None or prev.name not in TAIL_TAGS:
+                break
+            if len(prev.get_text(strip=True)) > TAIL_MAX_CHARS:
+                break
+            tail.insert(0, prev)
+            node = prev
+        if not tail:
+            continue
+        if _prev_content_sibling(tail[0]) is None:
+            continue                       # the "tail" IS the whole section
+        # Smallest move first: pulling more blocks than needed can overflow the
+        # target page (net zero pages -> futile). Try just the last block, then
+        # the pair.
+        n_before = _render_page_count(str(soup), css, mediabox, tmpdir)
+        moved = False
+        for k in range(1, len(tail) + 1):
+            attempt = tail[-k:]
+            for el in reversed(attempt):
+                w.insert(0, el.extract())
+            n_after = _render_page_count(str(soup), css, mediabox, tmpdir)
+            if n_after < n_before:
+                moved = True
+                break
+            for el in attempt:             # no page saved — put them back
+                w.insert_before(el.extract())
+        if moved:
+            changed = True
+    return changed
+
+
 def paginate(soup, css, mediabox, tmpdir, doc_name, landscape):
     """Settle table chunking, heading-keep, and widow reflow together. Each pass
     can invalidate the others' measurements (a heading/widow page break shifts a
@@ -1169,11 +1275,24 @@ def paginate(soup, css, mediabox, tmpdir, doc_name, landscape):
         c2 = keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape)
         c3 = fix_paragraph_widows(soup, widow_blocks, css, mediabox, tmpdir, doc_name, landscape)
         if not (c2 or c3):
-            pack_sparse_pages(soup, css, mediabox, tmpdir, doc_name, landscape)
+            _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape)
             return
     print(f"WARNING: {doc_name}: pagination did not converge in "
           f"{MAX_PAGINATE_ITERS} passes", file=sys.stderr)
+    _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape)
+
+
+def _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape):
+    """pack_sparse_pages tightens whitespace by pulling pinned chunks back up —
+    which shifts everything after them and can strand a section tail (or a
+    heading) that the settled layout had placed safely. Run the tail-pull and a
+    heading re-check AFTER packing, in a short bounded settle loop."""
     pack_sparse_pages(soup, css, mediabox, tmpdir, doc_name, landscape)
+    for _ in range(3):
+        t = pull_short_tails(soup, css, mediabox, tmpdir, doc_name, landscape)
+        k = keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape)
+        if not (t or k):
+            return
 
 
 # ---------------------------------------------------------------------------
