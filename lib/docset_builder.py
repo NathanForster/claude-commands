@@ -1210,7 +1210,10 @@ def build_toc_html(leaf_entries):
         if entry["part_title"] != last_part:
             if last_part is not None:
                 rows.append("</ul>")
-            rows.append(f"<h3>{entry['part_title']}</h3><ul>")
+            # list-style none: every entry already carries its section number
+            # ("1. Title (ACR)"), so a bullet glyph in front is redundant.
+            rows.append(f"<h3>{entry['part_title']}</h3>"
+                        f'<ul style="list-style-type: none;">')
             last_part = entry["part_title"]
         rows.append(f"<li>{toc_line(entry)}</li>")
     if last_part is not None:
