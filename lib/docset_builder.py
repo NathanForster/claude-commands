@@ -757,6 +757,35 @@ def _is_pagebreak_div(el):
             and "page-break-before" in (el.get("style") or ""))
 
 
+def _sole_wrapped(h):
+    """True when `h` is the only content of a page-break wrapper this pass
+    created earlier (optionally alongside its carried <hr>). Such a heading's
+    effective position in the flow is its WRAPPER's, so sibling walks must use
+    the wrapper as the anchor."""
+    p = h.parent
+    if p is None or not _is_pagebreak_div(p):
+        return False
+    tags = [c for c in p.children if not isinstance(c, NavigableString)
+            or str(c).strip() != ""]
+    tags = [c for c in tags if getattr(c, "name", None) is not None]
+    return all(c is h or c.name == "hr" for c in tags)
+
+
+def _preceding_hr(h, anchor):
+    """The <hr> separator immediately before the heading (skipping blank text) —
+    inside its wrapper first, else before the anchor. It should travel with the
+    heading when it moves; left behind it strands ALONE on an otherwise-empty
+    page (observed: FRIS docset STR §4.4, a full blank-but-for-the-rule page)."""
+    for node in ((h, anchor) if anchor is not h else (h,)):
+        for sib in node.previous_siblings:
+            if isinstance(sib, NavigableString):
+                if str(sib).strip() == "":
+                    continue
+                return None
+            return sib if sib.name == "hr" else None
+    return None
+
+
 def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
     """Move each stranded section heading onto the page where its content starts.
     Run this AFTER repeat_headers_across_pages so it sees the final table
@@ -781,29 +810,68 @@ def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
     # fine (moving a sub-heading down strands its parent). Those must stay
     # eligible so the cascade is caught on a subsequent pass.
     handled = set()
+    retried = set()
     changed = False
     tc = 0
-    for _pass in range(2 * len(heads) + 5):
+
+    def _map_target(h):
+        """(anchor, next-block, content-start-id) for a heading, or None.
+        Assigns the content-start element a measurable id on demand."""
+        nonlocal tc
+        anchor = h.parent if _sole_wrapped(h) else h
+        nxt = _next_block_element(anchor)
+        if nxt is None:
+            return None
+        tgt = _content_start_target(nxt)
+        if tgt is None:
+            return None
+        if not tgt.get("id"):
+            tgt["id"] = f"kht{tc}"
+            tc += 1
+        return anchor, nxt, tgt["id"]
+
+    def _requeue_restranded():
+        """Second chance for already-handled headings: a LATER move can re-strand
+        an earlier one (observed: FRIS docset STR §4.4 left heading-only on a
+        page). Un-handle each currently-stranded handled heading ONCE — the
+        `retried` set bounds this, so the pass still terminates."""
+        stale = [h for h in soup.find_all(HEADING_TAGS)
+                 if h.get("id") in handled and h.get("id") not in retried
+                 and _map_target(h) is not None]
+        if not stale:
+            return False
+        page_of, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
+        requeued = False
+        for h in stale:
+            mapped = _map_target(h)
+            if mapped is None:
+                continue
+            anchor, _nxt, tid = mapped
+            aid = anchor.get("id") or h.get("id")
+            hp = page_of.get(aid, page_of.get(h.get("id")))
+            tp = page_of.get(tid)
+            if hp is not None and tp is not None and hp < tp:
+                handled.discard(h["id"])
+                retried.add(h["id"])
+                requeued = True
+        return requeued
+
+    for _pass in range(3 * len(heads) + 5):
         # (Re)map each still-eligible heading to the element that marks where its
         # content starts, tagging that element with a measurable id.
-        targets = {}  # heading id -> (next-block element, content-start id)
+        targets = {}  # heading id -> (anchor, next-block element, content-start id)
         for h in soup.find_all(HEADING_TAGS):
             hid = h.get("id")
             if hid in handled:
                 continue
-            nxt = _next_block_element(h)
-            if nxt is None:
+            mapped = _map_target(h)
+            if mapped is None:
                 handled.add(hid)           # nothing follows — nothing to do
                 continue
-            tgt = _content_start_target(nxt)
-            if tgt is None:
-                handled.add(hid)
-                continue
-            if not tgt.get("id"):
-                tgt["id"] = f"kht{tc}"
-                tc += 1
-            targets[hid] = (nxt, tgt["id"])
+            targets[hid] = mapped
         if not targets:
+            if _requeue_restranded():
+                continue
             return changed
         page_of, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
 
@@ -814,30 +882,52 @@ def keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape):
             hid = h.get("id")
             if hid not in targets:
                 continue
-            nxt, tid = targets[hid]
+            anchor, nxt, tid = targets[hid]
             hp, tp = page_of.get(hid), page_of.get(tid)
             if hp is not None and tp is not None and hp < tp:
-                cand = (h, nxt, tid)
+                cand = (h, anchor, nxt, tid)
                 break
         if cand is None:
+            if _requeue_restranded():
+                continue
             return changed
 
-        h, nxt, tid = cand
+        h, anchor, nxt, tid = cand
+        hr = _preceding_hr(h, anchor)
+        old_wrapper = anchor if anchor is not h else None
         if _is_pagebreak_div(nxt):
             # Content is force-broken to a fresh page; ride along inside it so
             # the heading sits at that page's top. This co-locates by
             # construction (a heading is far shorter than a page), so keep it.
+            # The preceding <hr> separator travels too — left behind it strands
+            # alone on an otherwise-empty page.
             nxt.insert(0, h.extract())
+            if hr is not None:
+                nxt.insert(0, hr.extract())
+            if old_wrapper is not None and old_wrapper.find(True) is None:
+                old_wrapper.decompose()    # drop the emptied earlier wrapper
             handled.add(h["id"])
             changed = True
             continue
 
-        # Otherwise give the heading its own page break, then verify it worked.
+        if old_wrapper is not None:
+            # Already on its own page break yet still ahead of its content — a
+            # second break cannot help; leave it (each id is retried at most
+            # once via `retried`).
+            handled.add(h["id"])
+            continue
+
+        # Otherwise give the heading its own page break (separator riding
+        # along), then verify it worked.
         wrapper = soup.new_tag("div")
         wrapper["style"] = "page-break-before: always"
         h.wrap(wrapper)
+        if hr is not None:
+            wrapper.insert(0, hr.extract())
         page_of2, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
         if page_of2.get(h["id"]) != page_of2.get(tid):
+            if hr is not None:
+                wrapper.insert_before(hr.extract())   # restore the separator
             wrapper.unwrap()               # futile (content can't share the
             #                                page, e.g. a page-tall first row) —
             #                                leave the heading where it was.
