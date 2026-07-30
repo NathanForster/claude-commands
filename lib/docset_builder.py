@@ -1292,7 +1292,55 @@ def _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape):
         t = pull_short_tails(soup, css, mediabox, tmpdir, doc_name, landscape)
         k = keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape)
         if not (t or k):
-            return
+            break
+    balance_table_tail_widows(soup, css, mediabox, tmpdir, doc_name, landscape)
+    # Row-88(b) (unpushable-paragraph widow) deliberately NOT handled here: an
+    # s57 bolt-on split pass (tail words -> page-break-before continuation)
+    # fixed its targets but CREATED widows downstream — a post-settle pass
+    # cannot re-verify globally. (b) needs integration into the paginate settle
+    # loop (split as another convergence operation) plus ZWSP-aware word
+    # splitting; see BACKLOG row 88.
+
+
+def balance_table_tail_widows(soup, css, mediabox, tmpdir, doc_name, landscape):
+    """Row-88(a): a table whose FINAL chunk carries a single body row renders as
+    one lonely row under a dutifully-repeated header. Steal the DONOR (previous)
+    fragment's last row so the tail page carries two rows; measure and revert if
+    the tail chunk then spans pages (a near-page-tall stolen row). Runs after
+    the layout is fully settled: the donor only SHRINKS (its page gains
+    whitespace, nothing reflows past a page-break-before chunk boundary), so no
+    downstream layout can be invalidated."""
+    changed = False
+    families = {}
+    for wrapper in soup.find_all("div", attrs={"data-chunk": True}):
+        families.setdefault(wrapper["data-chunk"], []).append(wrapper)
+    for src_id, wrappers in families.items():
+        last_tbody = wrappers[-1].find("tbody")
+        if last_tbody is None:
+            continue
+        last_rows = last_tbody.find_all("tr", recursive=False)
+        if len(last_rows) != 1:
+            continue
+        if len(wrappers) >= 2:
+            donor_tbody = wrappers[-2].find("tbody")
+        else:
+            src = soup.find("table", id=src_id)
+            donor_tbody = src.find("tbody") if src else None
+        if donor_tbody is None:
+            continue
+        donor_rows = donor_tbody.find_all("tr", recursive=False)
+        if len(donor_rows) < 3:
+            continue  # stealing would just move the widow to the donor
+        moved = donor_rows[-1].extract()
+        last_tbody.insert(0, moved)
+        page_of, _ = measure_rows(str(soup), css, mediabox, tmpdir, doc_name)
+        p_moved = page_of.get(moved.get("id"))
+        p_widow = page_of.get(last_rows[0].get("id"))
+        if p_moved is None or p_widow is None or p_moved != p_widow:
+            donor_tbody.append(moved.extract())  # revert: tail no longer one page
+        else:
+            changed = True
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1412,22 +1460,42 @@ def toc_search_snippet(entry):
     return f"({entry['acr']}) - p. {entry['page']}"
 
 
-def build_toc_html(leaf_entries):
+def build_toc_html(leaf_entries, break_before_parts=()):
+    """break_before_parts: part titles that must start a fresh TOC page — fed by
+    the front-matter orphan pass (a part <h3> last on its page with its entries
+    overleaf; backlog row 88 class (c))."""
     rows = []
     last_part = None
     for entry in leaf_entries:
         if entry["part_title"] != last_part:
             if last_part is not None:
                 rows.append("</ul>")
+            brk = (' style="page-break-before: always;"'
+                   if entry["part_title"] in break_before_parts else "")
             # list-style none: every entry already carries its section number
             # ("1. Title (ACR)"), so a bullet glyph in front is redundant.
-            rows.append(f"<h3>{entry['part_title']}</h3>"
+            rows.append(f"<h3{brk}>{entry['part_title']}</h3>"
                         f'<ul style="list-style-type: none;">')
             last_part = entry["part_title"]
         rows.append(f"<li>{toc_line(entry)}</li>")
     if last_part is not None:
         rows.append("</ul>")
     return "".join(rows)
+
+
+def _toc_part_orphan_titles(pdf_path, part_titles):
+    """Part headings that render as the LAST text line of a non-final
+    front-matter page — their entries sit overleaf, the row-88(c) orphan.
+    The cover/TOC html never runs the body keep-heading pass, so this is its
+    own verification-based equivalent."""
+    doc = fitz.open(str(pdf_path))
+    orphans = []
+    for pno in range(doc.page_count):
+        lines = [ln.strip() for ln in doc[pno].get_text().splitlines() if ln.strip()]
+        if lines and pno < doc.page_count - 1 and lines[-1] in part_titles:
+            orphans.append(lines[-1])
+    doc.close()
+    return orphans
 
 
 def build_cover_html(toc_html, title, subtitle=None, cover_lines=()):
@@ -1597,9 +1665,21 @@ def _build(tmpdir, structure, docs_dir, out_path, title, subtitle,
             idx += 1
 
     def render_front_matter(cover_pdf):
-        render_story_to_pdf(
-            build_cover_html(build_toc_html(leaf_entries), title, subtitle, cover_lines),
-            css_portrait, portrait_box, cover_pdf, doc_name="cover/TOC")
+        # Row-88(c): keep part headings with their first entries. Render,
+        # detect orphaned part <h3>s (last line of their page), push each onto
+        # the next page, repeat until none remain (bounded by the part count).
+        part_titles = {e["part_title"] for e in leaf_entries}
+        breaks = set()
+        for _ in range(len(part_titles) + 1):
+            render_story_to_pdf(
+                build_cover_html(build_toc_html(leaf_entries, breaks),
+                                 title, subtitle, cover_lines),
+                css_portrait, portrait_box, cover_pdf, doc_name="cover/TOC")
+            new = [t for t in _toc_part_orphan_titles(cover_pdf, part_titles)
+                   if t not in breaks]
+            if not new:
+                break
+            breaks.update(new)
 
     # First pass: render the cover+TOC without page numbers just to learn how
     # many pages the front matter itself takes up.
