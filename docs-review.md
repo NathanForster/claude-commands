@@ -101,6 +101,57 @@ list of discrepancies:
 
 ---
 
+## Step 3.5 — Regenerate derived documents
+
+Some documentation folders contain **derived documents**: files that are generated
+from another source (a longer working document, a database, a config) by a script,
+rather than written by hand. A condensed summary of a large table, a one-row-per-item
+index, an auto-built inventory — all common.
+
+These create two traps, and both are silent:
+
+1. **Editing a derived document instead of its source.** Step 3 will happily "fix" a
+   stale figure in a generated file, and the next regeneration will discard the fix
+   while the underlying source stays wrong.
+2. **Editing a source and not regenerating.** Step 3 corrects the working document,
+   but the composite PDF (Step 4) still carries the *old* generated copy — so the
+   deliverable silently contradicts the repository.
+
+**Identify derived documents during Step 0's inventory.** Signals, in order of
+reliability:
+
+- The document's own header says so — "generated", "generated from `X`", "do not edit
+  by hand", "run `<script>` to refresh".
+- A build/config manifest marks it (e.g. a docset config's notes for a leaf).
+- A script exists whose output path is that document (`build_*_summary.py`,
+  `gen_*.py`, `make_*` and similar, typically alongside the composite's build script).
+
+**Then:**
+
+1. **Treat every derived document as read-only in Steps 1–3.** Review it for accuracy
+   as normal, but route every fix to its *source*, and note in the findings table
+   which source you are editing and which derived file it feeds.
+2. **Regenerate each derived document** whose source you touched — and, when cheap,
+   regenerate all of them regardless, since a source may have changed outside this
+   review:
+
+   ```powershell
+   python <path-to-generator>.py
+   ```
+
+3. **Regenerate before Step 4, never after** — the composite is assembled from the
+   files on disk, so a generator run after the PDF build has no effect on the PDF.
+4. **Read the generator's output.** These scripts often carry drift tripwires (row
+   counts, expected totals) that warn instead of failing. A warning here usually means
+   the source gained or lost rows — confirm that was intended before moving on, and
+   report it either way.
+5. If a generator **fails**, stop and report. Do not hand-edit the derived file to
+   work around it, and do not build the composite from a stale copy.
+
+If the folder has no derived documents, skip this step.
+
+---
+
 ## Step 4 — Rebuild the composite PDF (if present)
 
 If the documentation folder contains a **composite/combined PDF** (a single PDF
@@ -140,6 +191,8 @@ Summarize:
 - Findings by type: stale/inaccurate fixed, backfilled sections, cross-reference
   repairs, terminology alignments.
 - Remaining `[TBD]` items, each with the specific input it is waiting on.
+- Derived documents: which were regenerated, and any tripwire warnings their
+  generators emitted.
 - Composite PDF: rebuilt / skipped (no PDF) / blocked (no script found).
 - Anything that looked wrong but you left unchanged, and why.
 
@@ -157,6 +210,8 @@ Summarize:
   document that is missing (a genuine backfill); flag additions for the user first.
 - Prefer running the PDF build script over any manual PDF manipulation — the
   script is the source of truth for how the composite is assembled.
+- Never hand-edit a generated document (Step 3.5). Edit its source and regenerate.
+  An edit to a derived file looks correct right up until the next build erases it.
 - If the review surfaces contradictions the code can't resolve (two documents
   disagree and neither matches the code), stop and ask rather than guessing which
   is correct.

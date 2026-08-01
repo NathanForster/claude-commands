@@ -46,17 +46,25 @@ Report the output path and page count, then stop.
    - If neither exists, offer to create a `DOCSET.json` (see *Bootstrapping*) —
      do not invent a structure silently.
 
-2. **Run it** from the repo root, using the project's Python:
+2. **Regenerate any derived documents first.** If a leaf is generated from another
+   source by a script (its header says "generated", or the config's notes say so, or
+   a `build_*_summary.py`-style script writes it), run that generator **before** the
+   composite build — the set is assembled from what is on disk, so a stale generated
+   leaf ships silently. Read each generator's output: drift tripwires warn rather
+   than fail. If one errors, stop and report; never build from a stale copy. Full
+   treatment in `/docs-review` Step 3.5.
+
+3. **Run it** from the repo root, using the project's Python:
    - Build script: `python orchestrator/build_docset_pdf.py`
    - Bare config: `python <lib>/docset_builder.py DOCSET.json`
 
-3. **Verify**: the script exited 0, the output PDF's timestamp advanced, and the
+4. **Verify**: the script exited 0, the output PDF's timestamp advanced, and the
    printed page count is sane. If the engine printed any `WARNING:` lines
    (missing source doc, TOC page-count drift, non-convergent layout), surface
    them — they indicate a doc that didn't make it in or a layout that needs a
    look.
 
-4. **Report**: output path, page count, TOC entry count, and any warnings.
+5. **Report**: output path, page count, TOC entry count, and any warnings.
 
 ---
 
