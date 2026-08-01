@@ -117,14 +117,24 @@ These create two traps, and both are silent:
    but the composite PDF (Step 4) still carries the *old* generated copy — so the
    deliverable silently contradicts the repository.
 
-**Identify derived documents during Step 0's inventory.** Signals, in order of
-reliability:
+**Identify derived documents during Step 0's inventory.** Signals, strongest first —
+prefer the structural ones, which are exact, over scanning prose, which is not:
 
-- The document's own header says so — "generated", "generated from `X`", "do not edit
-  by hand", "run `<script>` to refresh".
-- A build/config manifest marks it (e.g. a docset config's notes for a leaf).
-- A script exists whose output path is that document (`build_*_summary.py`,
-  `gen_*.py`, `make_*` and similar, typically alongside the composite's build script).
+- **A script's output path is that document.** Look for `build_*_summary.py`, `gen_*.py`,
+  `make_*` and similar, typically alongside the composite's build script, and read what
+  each one writes. This is definitive: a file something writes IS generated.
+- **A build/config manifest marks it** (e.g. a docset config's notes for a leaf).
+- **The document's own header says so** — "generated", "generated from `X`", "do not edit
+  by hand", "run `<script>` to refresh". Useful, but the weakest of the three and not
+  sufficient alone. It fails in both directions: a generated file whose marker sits below
+  the header block (or that says "condensed" rather than "generated") is missed, and a
+  hand-written document that *mentions* a generated one — a changelog noting "replaced the
+  appendix with a generated summary" — matches when it should not. Both were observed on a
+  real suite. Use it to corroborate, then confirm against a script or the manifest.
+
+Cross-check the signals against each other. Where they disagree, the script's output path
+wins, and a generated document whose header does not announce itself is worth fixing at
+the generator — a reader who opens that file has no way to know their edit is doomed.
 
 **Then:**
 
