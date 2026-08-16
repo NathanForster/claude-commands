@@ -995,11 +995,17 @@ def _wrap_last_word(el, soup, span_id):
     s = str(last)
     stripped = s.rstrip()
     trail = s[len(stripped):]
-    head, _, word = stripped.rpartition(" ")
+    head, sep, word = stripped.rpartition(" ")
     span = soup.new_tag("span", id=span_id)
     span.string = word + trail
-    if head:
-        new_head = NavigableString(head + " ")
+    # Branch on the SEPARATOR, not on `head`: when the last text node is a lone
+    # word carrying a leading space (" 741" -- the shape produced whenever inline
+    # markup precedes the final word, e.g. "<strong>Passed:</strong> 741"),
+    # rpartition returns head="" with sep=" ". Testing `head` took the else path
+    # and replaced the whole node, silently swallowing that space and rendering
+    # "Passed:741". Rare while only <p> was tagged; systematic once <li> was.
+    if sep:
+        new_head = NavigableString(head + sep)
         last.replace_with(new_head)
         new_head.insert_after(span)
     else:
