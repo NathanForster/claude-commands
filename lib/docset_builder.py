@@ -121,6 +121,10 @@ MAX_PAGINATE_ITERS = 8       # outer table/heading/widow convergence loop
 BODY_LINE_H = 14.2           # body-text baseline step (10.5px * 1.35)
 WIDOW_TAIL_MAX = 2.4 * BODY_LINE_H   # reflow a paragraph only if <= ~2 lines spill
 CONTENT_TOP = PAGE_MARGIN + BODY_MARGIN   # y where page content begins (46.5)
+BODY_FONT_SIZE = 10.5        # BASE_CSS body font-size (BODY_LINE_H / 1.35)
+SPLIT_TARGET_LINES = 2.0     # a row-88(b) continuation must carry >= this many lines
+SPLIT_MIN_KEPT_WORDS = 8     # never leave the source block a stub
+SPLIT_MAX_MOVE_WORDS = 80    # runaway guard on the donated tail
 
 ZWSP = "​"
 # Preferred soft-break points inside long tokens (break AFTER these chars).
@@ -1004,11 +1008,19 @@ def _wrap_last_word(el, soup, span_id):
 
 
 def _tag_widow_blocks(soup):
-    """Tag every non-empty <p> with an id and wrap its last word in a <span id>.
-    Done once, before the pagination loop. Returns [(para_id, word_id), ...]."""
-    blocks = []
+    """Tag every non-empty <p> and <li> with an id and wrap its last word in a
+    <span id>. Done once, before the pagination loop.
+
+    Returns (push_blocks, split_blocks):
+      * push_blocks  -- <p> only, for fix_paragraph_widows' push-the-whole-block
+        pass. Deliberately excludes <li>: pushing a list item onto the next page
+        would strand it from its list, and that pass's behaviour is long-settled.
+      * split_blocks -- <p> AND <li>, for the row-88(b) tail split, which does not
+        move the block and so is safe on list items (the real-world (b) instances
+        were page-tall bullets)."""
+    push_blocks, split_blocks = [], []
     wi = 0
-    for el in soup.find_all("p"):
+    for el in soup.find_all(["p", "li"]):
         if not el.get_text(strip=True):
             continue
         wid = _wrap_last_word(el, soup, f"ww{wi}")
@@ -1016,9 +1028,12 @@ def _tag_widow_blocks(soup):
             continue
         if not el.get("id"):
             el["id"] = f"wp{wi}"
-        blocks.append((el["id"], wid))
+        entry = (el["id"], wid)
+        split_blocks.append(entry)
+        if el.name == "p":
+            push_blocks.append(entry)
         wi += 1
-    return blocks
+    return push_blocks, split_blocks
 
 
 def fix_paragraph_widows(soup, blocks, css, mediabox, tmpdir, doc_name, landscape):
@@ -1060,6 +1075,150 @@ def fix_paragraph_widows(soup, blocks, css, mediabox, tmpdir, doc_name, landscap
             changed = True
         handled.add(pid)
     return changed
+
+
+def body_text_width(s):
+    """Width of a string at BODY font size (text_width() measures at table size)."""
+    try:
+        return fitz.get_text_length(s, fontname="helv", fontsize=BODY_FONT_SIZE)
+    except Exception:
+        return len(s) * CHAR_W * (BODY_FONT_SIZE / TABLE_FONT_SIZE)
+
+
+def _tail_words_for_lines(words, content_w, lines=SPLIT_TARGET_LINES):
+    """How many trailing words are needed to occupy >= `lines` lines. Accumulates
+    from the end until the measured width exceeds the target, so the continuation
+    is guaranteed to wrap rather than sit as another lone line."""
+    target = lines * content_w * 0.98      # 2% slack: wrapping is never perfect
+    used, n = 0.0, 0
+    for w in reversed(words):
+        used += body_text_width(w + " ")
+        n += 1
+        if used >= target or n >= SPLIT_MAX_MOVE_WORDS:
+            break
+    return n
+
+
+def _split_block_tail(root, pid, wid, n_words, cont_id, src_wid):
+    """In the tree `root`, move the last `n_words` words of block `pid` into a
+    continuation pinned to the next page, then re-wrap the SOURCE block's new last
+    word in <span id=src_wid> so the remainder stays widow-measurable. Returns the
+    continuation tag, or None when the tail is not plain text or is too short.
+
+    Re-tagging the source is not cosmetic: the original last-word span travels into
+    the continuation, so without it the shortened source becomes invisible to widow
+    detection — which is how the first cut of this pass silently relocated a widow
+    instead of removing it (n=312 in the synthetic sweep).
+
+    Shape depends on the block: a <p> gets a SIBLING <p>; an <li> gets a NESTED
+    <div> (a sibling <li> would draw a second bullet). ZWSP-safe by construction:
+    split points come from str.split(), and U+200B is not Python whitespace, so a
+    soft-broken token can never be cut at its invisible break — the s57 attempt's
+    mangled joins came from splitting without that guarantee."""
+    el, span = root.find(id=pid), root.find(id=wid)
+    if el is None or span is None:
+        return None
+    prev = span.previous_sibling
+    if not isinstance(prev, NavigableString):
+        return None                       # inline markup at the tail -- leave alone
+    words = str(prev).split()
+    if len(words) < n_words + SPLIT_MIN_KEPT_WORDS:
+        return None
+    keep, move = words[:len(words) - n_words], words[len(words) - n_words:]
+
+    prev.replace_with(NavigableString(" ".join(keep) + " "))
+    cont = root.new_tag("div" if el.name == "li" else "p", id=cont_id)
+    cont["style"] = "page-break-before: always; margin-top: 0"
+    cont.append(NavigableString(" ".join(move) + " "))
+    cont.append(span.extract())
+    # Re-tag the source BEFORE attaching the continuation. For an <li> the
+    # continuation nests INSIDE the block, so doing this afterwards would wrap a
+    # word of the continuation and make the source look like it still spans.
+    _wrap_last_word(el, root, src_wid)
+    if el.name == "li":
+        el.append(cont)                   # nested: stays inside the bullet
+    else:
+        el.insert_after(cont)
+    return cont
+
+
+def split_tall_paragraph_widows(soup, blocks, css, mediabox, tmpdir, doc_name,
+                                landscape, handled):
+    """Row-88(b): a block TALLER than one page cannot be pushed whole -- so
+    fix_paragraph_widows correctly declines it -- and Story's greedy split can then
+    leave its final line alone at the top of the next page. Donate ~2 lines' worth
+    of trailing words to a continuation pinned to that page, so it opens with two
+    lines instead of one.
+
+    Runs as a convergence operation INSIDE paginate's settle loop. That is the whole
+    difference from the reverted s57 attempt, which ran once after the layout had
+    settled: a split shifts everything downstream, and only a pass that is followed
+    by another global re-measure can catch the widow it may itself create. Here the
+    loop re-runs chunking, heading-keep and both widow passes afterwards.
+
+    Each split is measured and reverted unless the continuation really carries >= 2
+    lines. `handled` is shared with the caller so a block is attempted only once per
+    document -- splits cannot oscillate."""
+    if not blocks:
+        return False
+    capacity = page_content_height(landscape)
+    content_w = table_width_pt(landscape)
+    page_of, top_of, bot_of = _measure_pos(str(soup), css, mediabox, tmpdir, doc_name)
+
+    for pid, wid in list(blocks):
+        if pid in handled:
+            continue
+        pp, wp = page_of.get(pid), page_of.get(wid)
+        if pp is None or wp is None or wp <= pp:
+            continue                                   # doesn't span a page
+        tail = bot_of.get(wid, CONTENT_TOP) - CONTENT_TOP
+        first_portion = bot_of.get(pid, 0.0) - top_of.get(pid, 0.0)
+        if tail > WIDOW_TAIL_MAX:
+            continue                                   # real multi-line spill, fine
+        el, span = soup.find(id=pid), soup.find(id=wid)
+        if el is None or span is None:
+            handled.add(pid)
+            continue
+        # Only blocks TALLER than a page are ours: a block that fits could be moved
+        # whole, and splitting one that fits is both uglier and — measured — a net
+        # loss. Splitting every short-tailed <li> regardless of height was tried
+        # (2026-08-01) to reach a pushable <li> widow that no pass owns; it fired on
+        # many list items, grew the composite 269 -> 271 pages and took its
+        # lone-line pages from 1 to 3, so it is deliberately NOT done. That
+        # remaining case is recorded as row 88(d), not fixed here.
+        if first_portion + tail <= capacity - CHUNK_SLACK:
+            continue                                   # pushable: not our case
+        prev = span.previous_sibling
+        if not isinstance(prev, NavigableString):
+            handled.add(pid)
+            continue
+
+        n = _tail_words_for_lines(str(prev).split(), content_w)
+        cont_id, src_wid = f"wc{pid}", f"wr{pid}"
+        handled.add(pid)                               # one attempt per block
+
+        # Try it on a COPY first. Accept/revert on a text split is not a wrap/unwrap
+        # like the other passes, and the acceptance test has to see the WHOLE
+        # re-measured document, so the trial tree is both simpler and safer.
+        trial = copy.copy(soup)
+        if _split_block_tail(trial, pid, wid, n, cont_id, src_wid) is None:
+            continue
+        page2, top2, bot2 = _measure_pos(str(trial), css, mediabox, tmpdir, doc_name)
+
+        cont_h = bot2.get(cont_id, 0.0) - top2.get(cont_id, 0.0)
+        if cont_h < (SPLIT_TARGET_LINES - 0.2) * BODY_LINE_H:
+            continue                                   # didn't buy a second line
+        # ... and the shortened source must not have inherited the widow.
+        sp, sw = page2.get(pid), page2.get(src_wid)
+        if sp is not None and sw is not None and sw > sp:
+            if bot2.get(src_wid, CONTENT_TOP) - CONTENT_TOP <= WIDOW_TAIL_MAX:
+                continue                               # widow merely relocated
+        if _split_block_tail(soup, pid, wid, n, cont_id, src_wid) is None:
+            continue
+        blocks.append((cont_id, wid))                  # continuation stays managed
+        blocks.append((pid, src_wid))                  # so does the shortened source
+        return True                                    # re-settle before the next
+    return False
 
 
 def _merge_chunks(soup):
@@ -1268,48 +1427,75 @@ def paginate(soup, css, mediabox, tmpdir, doc_name, landscape):
     (repeated header on each continuation), then re-place stranded headings and
     widowed paragraphs. Converges when neither headings nor widows move — at which
     point the (deterministic) table packing is stable too."""
-    widow_blocks = _tag_widow_blocks(soup)
+    push_blocks, split_blocks = _tag_widow_blocks(soup)
+    split_handled = set()
     for _ in range(MAX_PAGINATE_ITERS):
         _merge_chunks(soup)
         repeat_headers_across_pages(soup, css, mediabox, tmpdir, doc_name, landscape)
         c2 = keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape)
-        c3 = fix_paragraph_widows(soup, widow_blocks, css, mediabox, tmpdir, doc_name, landscape)
-        if not (c2 or c3):
-            _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape)
+        c3 = fix_paragraph_widows(soup, push_blocks, css, mediabox, tmpdir, doc_name, landscape)
+        # Row-88(b): only once the pushable widows have settled, so a block is
+        # split only when pushing genuinely cannot fix it.
+        c4 = split_tall_paragraph_widows(soup, split_blocks, css, mediabox, tmpdir,
+                                         doc_name, landscape, split_handled)
+        if not (c2 or c3 or c4):
+            _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape,
+                             push_blocks, split_blocks, split_handled)
             return
     print(f"WARNING: {doc_name}: pagination did not converge in "
           f"{MAX_PAGINATE_ITERS} passes", file=sys.stderr)
-    _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape)
+    _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape,
+                     push_blocks, split_blocks, split_handled)
 
 
-def _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape):
+def _pack_and_settle(soup, css, mediabox, tmpdir, doc_name, landscape,
+                     push_blocks=(), split_blocks=(), split_handled=None):
     """pack_sparse_pages tightens whitespace by pulling pinned chunks back up —
     which shifts everything after them and can strand a section tail (or a
     heading) that the settled layout had placed safely. Run the tail-pull and a
-    heading re-check AFTER packing, in a short bounded settle loop."""
+    heading re-check AFTER packing, in a short bounded settle loop.
+
+    Row-88(d): the WIDOW passes belong in that loop too. Packing and tail-pulling
+    move content after the main loop has converged, so they can re-widow a
+    paragraph the widow pass had already fixed — and with no widow pass afterwards
+    it survived into the final render (CTR §6.6 was widowed this way at p140 for
+    several builds). Both widow passes are re-run here for the same reason the
+    heading check is."""
+    if split_handled is None:
+        split_handled = set()
     pack_sparse_pages(soup, css, mediabox, tmpdir, doc_name, landscape)
     for _ in range(3):
         t = pull_short_tails(soup, css, mediabox, tmpdir, doc_name, landscape)
         k = keep_headings_with_next(soup, css, mediabox, tmpdir, doc_name, landscape)
-        if not (t or k):
+        # Row-88(d): the table-tail balancer belongs INSIDE this loop, ahead of the
+        # widow passes. Its own docstring reasoned only about the donor SHRINKING,
+        # but the tail chunk GROWS by the stolen row, so everything after the table
+        # shifts down — which is what re-widowed the CTR §6.6 paragraph after the
+        # widow passes had already settled it. It converges on its own (a tail with
+        # two rows is no longer a candidate).
+        b = balance_table_tail_widows(soup, css, mediabox, tmpdir, doc_name, landscape)
+        w = fix_paragraph_widows(soup, push_blocks, css, mediabox, tmpdir,
+                                 doc_name, landscape)
+        s = split_tall_paragraph_widows(soup, split_blocks, css, mediabox, tmpdir,
+                                        doc_name, landscape, split_handled)
+        if not (t or k or b or w or s):
             break
-    balance_table_tail_widows(soup, css, mediabox, tmpdir, doc_name, landscape)
-    # Row-88(b) (unpushable-paragraph widow) deliberately NOT handled here: an
-    # s57 bolt-on split pass (tail words -> page-break-before continuation)
-    # fixed its targets but CREATED widows downstream — a post-settle pass
-    # cannot re-verify globally. (b) needs integration into the paginate settle
-    # loop (split as another convergence operation) plus ZWSP-aware word
-    # splitting; see BACKLOG row 88.
+    # Row-88(b) is handled by split_tall_paragraph_widows INSIDE the paginate
+    # settle loop, not here — a post-settle bolt-on cannot re-verify globally,
+    # which is exactly why the s57 attempt created widows downstream.
 
 
 def balance_table_tail_widows(soup, css, mediabox, tmpdir, doc_name, landscape):
     """Row-88(a): a table whose FINAL chunk carries a single body row renders as
     one lonely row under a dutifully-repeated header. Steal the DONOR (previous)
     fragment's last row so the tail page carries two rows; measure and revert if
-    the tail chunk then spans pages (a near-page-tall stolen row). Runs after
-    the layout is fully settled: the donor only SHRINKS (its page gains
-    whitespace, nothing reflows past a page-break-before chunk boundary), so no
-    downstream layout can be invalidated."""
+    the tail chunk then spans pages (a near-page-tall stolen row).
+
+    Row-88(d) correction: an earlier version of this docstring claimed nothing
+    downstream could be invalidated, reasoning only about the donor SHRINKING. The
+    tail chunk also GROWS by the stolen row, so content following the table shifts
+    down by a row — enough to re-widow the next paragraph. It therefore runs INSIDE
+    _pack_and_settle's loop, ahead of the widow passes, rather than after them."""
     changed = False
     families = {}
     for wrapper in soup.find_all("div", attrs={"data-chunk": True}):
